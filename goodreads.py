@@ -193,13 +193,12 @@ class GoodreadsScraper:
             agg_rating = ld.get("aggregateRating", {})
             data = {
                 "id": book_id,
-                "title": ld.get("name"),
+                "title": html.unescape(ld.get("name", "")),
                 "author": self._safe_get_author(ld),
                 "avg_rating": agg_rating.get("ratingValue"),
                 "total_reviews": agg_rating.get("reviewCount"),
                 "pages": ld.get("numberOfPages"),
                 "lang": ld.get("inLanguage"),
-                "scraped_at": datetime.now().isoformat()
             }
 
             # Extract DOM data via JavaScript evaluation
