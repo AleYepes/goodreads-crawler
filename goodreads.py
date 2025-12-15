@@ -2,19 +2,19 @@ import argparse
 import json
 import os
 import re
+import glob
+import csv
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 import pandas as pd
 from dotenv import load_dotenv
+from tqdm import tqdm
 from playwright.sync_api import sync_playwright, Page, Response, TimeoutError as PlaywrightTimeoutError
-
 
 load_dotenv()
 DATA_DIR = Path("data")
-EXPORT_FILE = DATA_DIR / "goodreads_library_export.csv"
-OUTPUT_FILE = DATA_DIR / "books_data.csv"
 DATA_DIR.mkdir(exist_ok=True)
 
 
@@ -44,7 +44,12 @@ class GoodreadsExporter:
         except PlaywrightTimeoutError:
             raise Exception("Login failed - check credentials or handle 2FA manually")
     
-    def download_library(self, output_path: Path = EXPORT_FILE) -> pd.DataFrame:
+    def download_library(self) -> pd.DataFrame:
+        today_str = datetime.now().strftime("%d%m%y")
+        filename = f"{today_str}_goodreads_library_export.csv"
+        output_path = DATA_DIR / filename
+        
+        print("    Starting browser for export (Headed for Login)...")
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=False)
             context = browser.new_context(
@@ -56,30 +61,32 @@ class GoodreadsExporter:
             page.goto("https://www.goodreads.com/review/import", wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
             
-            # Prepare today's export if it's not listed
-            current_date = datetime.now().strftime("%m/%d/%Y")
-            file_list = page.locator(".fileList").first
-            if file_list.count() > 0 and current_date not in file_list.text_content():
-                export_button = page.locator(".js-LibraryExport").first
+            export_button = page.locator(".js-LibraryExport").first
+            if export_button.count() > 0:
                 export_button.click()
-            
-            # Poll until today's export appears
+                page.wait_for_timeout(3000)
+
             max_attempts = 90
+            file_list = page.locator(".fileList")
+            
             for _ in range(max_attempts):
-                file_list = page.locator(".fileList").first
-                if current_date in file_list.text_content():
-                    break
+                if file_list.count() > 0:
+                    link = file_list.locator("a").first
+                    if link.count() > 0:
+                        break
                 page.wait_for_timeout(1000)
             else:
-                raise TimeoutError("Export did not complete in time")
+                raise TimeoutError("Export generation did not complete in time")
             
             with page.expect_download() as download_info:
                 link = file_list.locator("a").first
                 link.click()
+            
             download = download_info.value
             download.save_as(output_path)
             browser.close()
-        
+            
+        print(f"    Downloaded new export: {filename}")
         return pd.read_csv(output_path)
 
 
@@ -87,6 +94,7 @@ class GoodreadsScraper:
     def __init__(self, page: Page):
         self.page = page
         self.captured_payloads = []
+        self.interstitial_handled = False  # Flag to track if we've closed the modal
         self.page.on("response", self._handle_network_response)
     
     def _handle_network_response(self, response: Response):
@@ -115,17 +123,34 @@ class GoodreadsScraper:
                 return item.get("name", "")
             return str(item)
         return ""
-    
+
+    def _handle_interstitial(self):
+        """Checks for and closes the 'Sign up' modal only if not yet handled."""
+        if self.interstitial_handled:
+            return
+
+        # Selector based on the HTML provided
+        close_btn = self.page.locator(".Overlay__close button").first
+        
+        # We use a short timeout because we don't want to wait if it's not there
+        if close_btn.count() > 0 and close_btn.is_visible():
+            try:
+                close_btn.click()
+                self.interstitial_handled = True
+                # tqdm.write("    [Info] Interstitial modal closed permanently.")
+            except Exception:
+                pass
+
     def scrape(self, book_id: int) -> Tuple[Optional[dict], List[int]]:
         self.captured_payloads.clear()
         url = f"https://www.goodreads.com/book/show/{book_id}"
         try:
             self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            
+            self._handle_interstitial()
+
             # Basic book LD-JSON data
             script = self.page.locator('script[type="application/ld+json"]').first
             if script.count() == 0:
-                print(f"    No LD-JSON found - Skipping {book_id}")
                 return None, []
             
             try:
@@ -152,7 +177,6 @@ class GoodreadsScraper:
                 "lang": ld.get("inLanguage"),
             }
             
-            # Star ratings histogram
             for star in range(5, 0, -1):
                 el = self.page.locator(f"[data-testid='labelTotal-{star}']").first
                 count = 0
@@ -163,12 +187,10 @@ class GoodreadsScraper:
                         count = int(clean_text)
                 data[f"{star}_star"] = count
             
-            # Genres
             genre_locs = self.page.locator(".BookPageMetadataSection__genreButton .Button__labelItem")
             genres = [t for t in genre_locs.all_text_contents() if t != "...more"]
             data["genres"] = "|".join(genres) if genres else ""
             
-            # Series
             series_loc = self.page.locator("h3.Text__italic a").first
             data["series"] = ""
             if series_loc.count() > 0:
@@ -176,7 +198,6 @@ class GoodreadsScraper:
                 if href:
                     data["series"] = href.split('/')[-1]
             
-            # Publication year
             pub_loc = self.page.locator("[data-testid='publicationInfo']").first
             data["year"] = ""
             if pub_loc.count() > 0:
@@ -184,13 +205,12 @@ class GoodreadsScraper:
                     data["year"] = int(pub_loc.text_content().split(', ')[-1])
                 except (ValueError, IndexError):
                     pass
-
+            
             desc_loc = self.page.locator("[data-testid='description'] span.Formatted").first
             if desc_loc.count() == 0:
                 desc_loc = self.page.locator(".DetailsLayoutRightParagraph__widthConstrained span.Formatted").first
             data["description"] = desc_loc.inner_html() if desc_loc.count() > 0 else ""
             
-            # Similar books
             if not self.captured_payloads:
                 try:
                     with self.page.expect_response(
@@ -221,102 +241,197 @@ class GoodreadsScraper:
             return data, list(similar_ids)
         
         except Exception as e:
-            print(f"Error scraping {book_id}: {e}")
+            tqdm.write(f"Error scraping {book_id}: {e}")
             return None, []
 
 
-def run_crawler(start_ids: List[int], output_path: Path = OUTPUT_FILE):
-    def _save_dataframe(existing_df: pd.DataFrame, new_records: List[dict], output_path: Path):
-        new_df = pd.DataFrame(new_records)
-        
-        if not existing_df.empty:
-            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-        else:
-            combined_df = new_df
-        
-        combined_df.to_csv(output_path, index=False)
-
-    queue = deque(start_ids)
-    if output_path.exists():
-        existing_df = pd.read_csv(output_path)
-        visited = set(existing_df['id'].astype(int))
-    else:
-        existing_df = pd.DataFrame()
-        visited = set()
+def get_latest_export_file() -> Optional[Path]:
+    pattern = str(DATA_DIR / "*_goodreads_library_export.csv")
+    files = glob.glob(pattern)
+    if not files:
+        return None
     
+    def extract_date(f_path):
+        name = Path(f_path).name
+        date_part = name.split('_')[0]
+        try:
+            return datetime.strptime(date_part, "%d%m%y")
+        except ValueError:
+            return datetime.min
+
+    latest_file = max(files, key=extract_date)
+    return Path(latest_file)
+
+
+def run_crawler(start_ids: List[int], output_path: Path):
+    # 1. Setup Tracking Sets
+    visited = set()
+    queued_set = set(start_ids)
+    queue = deque(start_ids)
+    
+    # 2. Check for existing data to resume
+    if output_path.exists():
+        print(f"Resuming from {output_path}...")
+        try:
+            # Optimize: Read chunks or just necessary columns
+            # float_precision='round_trip' helps ensure IDs don't get garbled if read as floats
+            existing_df = pd.read_csv(output_path, usecols=['id', 'similar_books'])
+            
+            # Similar ID extraction
+            visited = set(existing_df['id'].dropna().astype(int))
+            potential_pool = set(start_ids)
+            
+            if 'similar_books' in existing_df.columns:
+                sim_ids = (
+                    existing_df['similar_books']
+                    .dropna()
+                    .astype(str)
+                    .str.split('|')
+                    .explode()
+                )
+                valid_sims = sim_ids[pd.to_numeric(sim_ids, errors='coerce').notnull()].astype(int)
+                potential_pool.update(valid_sims.tolist())
+
+            # Rebuild Queue
+            queue_items = potential_pool - visited
+            queue = deque(list(queue_items))
+            queued_set = set(queue) | visited
+            
+        except Exception as e:
+            print(f"    [Warning] Error reading resume file: {e}")
+            print("    Starting fresh (or continuing with provided IDs only).")
+
+    # 3. Setup Browser and Scraper
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         context = browser.new_context(viewport={"width": 1280, "height": 800})
         page = context.new_page()
         scraper = GoodreadsScraper(page)
         
-        new_records = []
-        while queue:
-            current_id = queue.popleft()
-            if current_id in visited:
-                continue
-            
-            data, similar_ids = scraper.scrape(current_id)
-            visited.add(current_id)
-            
-            if data:
-                new_records.append(data)
-                added = 0
-                for sid in similar_ids:
-                    if sid not in visited and sid not in queue:
-                        queue.append(sid)
-                        added += 1
-                
-                if len(new_records) % 50 == 0:
-                    _save_dataframe(existing_df, new_records, output_path)
-                    print(f"[Checkpoint] Saved {len(new_records)} new records")
+        batch_records = []
+        BATCH_SIZE = 50
+        books_scraped_session = 0  # Local counter for restarts
         
-        if new_records:
-            _save_dataframe(existing_df, new_records, output_path)
-            print(f"✓ Finished. Total books: {len(existing_df)}")
-        
-        browser.close()
+        DATA_DIR.mkdir(exist_ok=True)
+
+        try:
+            # Update total to reflect what we actually know
+            with tqdm(total=len(visited) + len(queue), initial=len(visited), unit="book") as pbar:
+                while queue:
+                    # 4. Resource Management: Restart context every 200 books THIS SESSION
+                    if books_scraped_session > 0 and books_scraped_session % 200 == 0:
+                        tqdm.write("    [Maintenance] Restarting browser context to clear memory...")
+                        page.close()
+                        context.close()
+                        context = browser.new_context(viewport={"width": 1280, "height": 800})
+                        page = context.new_page()
+                        scraper = GoodreadsScraper(page) # Re-attach scraper to new page
+
+                    current_id = queue.popleft()
+                    
+                    # Double check (redundant but safe)
+                    if current_id in visited:
+                        continue
+                    
+                    pbar.set_description(f"Scraping {current_id}")
+                    
+                    # Scrape
+                    data, similar_ids = scraper.scrape(current_id)
+                    visited.add(current_id)
+                    books_scraped_session += 1
+                    pbar.update(1)
+                    
+                    if data:
+                        batch_records.append(data)
+                        
+                        # Queue Update
+                        for sid in similar_ids:
+                            if sid not in queued_set:
+                                queue.append(sid)
+                                queued_set.add(sid)
+                                pbar.total += 1
+                        
+                        # 5. Efficient Saving
+                        if len(batch_records) >= BATCH_SIZE:
+                            df = pd.DataFrame(batch_records)
+                            
+                            # Check if file exists right now to decide on header
+                            file_is_new = not output_path.exists()
+                            df.to_csv(output_path, mode='a', header=file_is_new, index=False)
+                            
+                            batch_records = [] 
+                            
+        except KeyboardInterrupt:
+            tqdm.write("\nStopping... Saving remaining records.")
+        except Exception as e:
+            tqdm.write(f"\n[Critical Error] {e}")
+        finally:
+            # Save leftovers
+            if batch_records:
+                df = pd.DataFrame(batch_records)
+                file_is_new = not output_path.exists()
+                df.to_csv(output_path, mode='a', header=file_is_new, index=False)
+                tqdm.write(f"Saved {len(batch_records)} remaining records.")
+            
+            browser.close()
+            print(f"✓ Finished. Total visited: {len(visited)}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Scrape Goodreads book data")
     parser.add_argument(
-        "--skip-download",
+        "--force-download",
         action="store_true",
-        help="Skip downloading library export if it already exists"
+        help="Force download of a new library export even if one exists"
     )
     parser.add_argument(
         "--start-ids",
         nargs="+",
         type=int,
-        help="Manually specify starting book IDs (overrides library export)"
+        help="Manually specify starting book IDs"
     )
     parser.add_argument(
         "--limit",
         type=int,
-        help="Limit number of books to scrape (for testing)"
+        help="Limit number of books to scrape"
     )
     
     args = parser.parse_args()
+    
+    today_str = datetime.now().strftime("%d%m%y")
+    output_path = DATA_DIR / f"{today_str}_books_data.csv"
+
+    start_ids = []
+    
     if args.start_ids:
         start_ids = args.start_ids
     else:
-        if args.skip_download and EXPORT_FILE.exists():
-            library_df = pd.read_csv(EXPORT_FILE)
-        else:
+        latest_export = get_latest_export_file()
+        should_download = args.force_download or (latest_export is None)
+        
+        if should_download:
             email = os.getenv("GOODREADS_EMAIL")
             password = os.getenv("GOODREADS_PASSWORD")
             if not email or not password:
-                print("ERROR: Set GOODREADS_EMAIL and GOODREADS_PASSWORD in .env file")
+                print("ERROR: Set credentials in .env file.")
                 return
+            
+            print("Initiating library download...")
             exporter = GoodreadsExporter(email, password)
             library_df = exporter.download_library()
+        else:
+            filename = latest_export.name
+            date_part = filename.split('_')[0]
+            formatted_date = f"{date_part[:2]}/{date_part[2:4]}/{date_part[4:]}"
+            print(f"Using existing export file from: {formatted_date} ({filename})")
+            library_df = pd.read_csv(latest_export)
         
         start_ids = library_df['Book Id'].astype(int).tolist()
-        if args.limit:
-            start_ids = start_ids[:args.limit]
 
-    run_crawler(start_ids)
+    if args.limit:
+        start_ids = start_ids[:args.limit]
+
+    run_crawler(start_ids, output_path)
 
 
 if __name__ == "__main__":
