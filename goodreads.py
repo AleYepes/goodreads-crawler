@@ -149,6 +149,7 @@ class GoodreadsScraper:
                 "avg_rating": agg_rating.get("ratingValue"),
                 "total_reviews": agg_rating.get("reviewCount"),
                 "pages": ld.get("numberOfPages"),
+                "lang": ld.get("inLanguage"),
             }
             
             # Star ratings histogram
@@ -183,6 +184,11 @@ class GoodreadsScraper:
                     data["year"] = int(pub_loc.text_content().split(', ')[-1])
                 except (ValueError, IndexError):
                     pass
+
+            desc_loc = self.page.locator("[data-testid='description'] span.Formatted").first
+            if desc_loc.count() == 0:
+                desc_loc = self.page.locator(".DetailsLayoutRightParagraph__widthConstrained span.Formatted").first
+            data["description"] = desc_loc.inner_html() if desc_loc.count() > 0 else ""
             
             # Similar books
             if not self.captured_payloads:
