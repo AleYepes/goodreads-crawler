@@ -69,30 +69,34 @@ def parse_similar_books_string(encoded_str):
 
 def prep_crawl_heapq(library_df):
     scraped_book_ids = set()
+    queued_book_ids = set()
     id_scraping_queue = []
-    seed_book_ids = library_df['book_id'].astype(int).tolist()
+    seed_book_ids = library_df['book_id'].dropna().astype(int).tolist()
 
-    # Find scraped and remaining books from previous crawling output
+    # Load existing progress
     if OUTPUT_PATH.exists():
-        df_iter = pd.read_csv(OUTPUT_PATH, usecols=['id', 'similar_books'], chunksize=5000)
+        df_iter = pd.read_csv(OUTPUT_PATH, usecols=['book_id', 'similar_books'], chunksize=5000)
         for chunk in df_iter:
-            scraped_book_ids.update(chunk['id'].dropna().astype(int).tolist())
+            scraped_book_ids.update(chunk['book_id'].dropna().astype(int).tolist())
             
-            for entry in chunk['similar_books'].dropna():
-                similar_books = parse_similar_books_string(entry)
+            for similar_books_string in chunk['similar_books'].dropna():
+                similar_books = parse_similar_books_string(similar_books_string)
                 for book_id, count_adj_rating in similar_books:
                     if book_id not in scraped_book_ids and book_id not in id_scraping_queue:
                         heapq.heappush(id_scraping_queue, (-count_adj_rating, book_id))
+                        queued_book_ids.add(book_id)
 
     # Find remaining books from library export
     for book_id in seed_book_ids:
         if book_id not in scraped_book_ids and book_id not in id_scraping_queue:
             heapq.heappush(id_scraping_queue, (-5.0, book_id)) # -5 max theoretical count_adj_rating to prioritize seed ids before others on the queue
+            queued_book_ids.add(book_id)
 
-    return id_scraping_queue, scraped_book_ids
+    return id_scraping_queue, scraped_book_ids, queued_book_ids
 
 
 async def fetch_book(context, book_id):
+    captured_payloads = []
 
     async def handle_response(response):
         if "graphql" in response.url and response.request.method == "POST":
@@ -100,7 +104,7 @@ async def fetch_book(context, book_id):
             captured_payloads.append(json_body)
 
     async def block_media(route):
-        if route.request.resource_type in ["image", "media"]:
+        if route.request.resource_type in ["image", "media", "font"]:
             await route.abort()
         else:
             await route.continue_()
@@ -197,7 +201,7 @@ async def fetch_book(context, book_id):
         while not any("getSimilarBooks" in str(p) for p in captured_payloads) and wait_attempts < PAYLOAD_WAIT_ATTEMPTS:
             await page.wait_for_timeout(500)
             wait_attempts += 1
-        page.remove_listener("response", handle_response)
+        page.remove_listener("response", handle_response) ####
         
         similar_books = []
         for payload in captured_payloads:
@@ -217,13 +221,10 @@ async def fetch_book(context, book_id):
                 count_adj_rating = avg_rating - (avg_rating - 3) / math.sqrt(rating_count + 1)
                 similar_books.append(f"{similar_book_id}:{count_adj_rating}")
 
-        similar_books = "|".join(similar_books)
-        book_data["similar_books"] = similar_books
-
+        book_data["similar_books"] = "|".join(similar_books)
         return book_data
 
     page = await context.new_page()
-    captured_payloads = []
     page.on("response", handle_response)
     await page.route("**/*", block_media)
 
@@ -247,7 +248,7 @@ async def fetch_book(context, book_id):
         await page.close()
 
 
-async def run_crawler(id_scraping_queue, scraped_book_ids):
+async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
     file_exists = OUTPUT_PATH.exists()
     field_names = [
         "book_id", "title", "authors", "avg_rating", "review_count", 
@@ -268,7 +269,7 @@ async def run_crawler(id_scraping_queue, scraped_book_ids):
             
             active_tasks = set()
             while id_scraping_queue or active_tasks:
-                while len(active_tasks) < CONCURRENCY and id_scraping_queue:
+                while len(active_tasks) < CONCURRENCY and queued_book_ids:
                     _, current_id = heapq.heappop(id_scraping_queue)
                     if current_id in scraped_book_ids:
                         continue
@@ -290,7 +291,7 @@ async def run_crawler(id_scraping_queue, scraped_book_ids):
                         similar_books = parse_similar_books_string(book_data.get('similar_books'))
                         added_count = 0
                         for similar_book_id, count_adj_rating in similar_books:
-                            if similar_book_id not in scraped_book_ids and similar_book_id not in id_scraping_queue:
+                            if similar_book_id not in scraped_book_ids and similar_book_id not in queued_book_ids:
                                 heapq.heappush(id_scraping_queue, (-count_adj_rating, similar_book_id))
                                 added_count += 1
                         pbar.total += added_count
@@ -322,8 +323,8 @@ def main():
     else:
         library_df = pd.read_csv(LIBRARY_PATH)
 
-    id_scraping_queue, scraped_book_ids = prep_crawl_heapq(library_df)
-    asyncio.run(run_crawler(id_scraping_queue, scraped_book_ids))
+    id_scraping_queue, scraped_book_ids, queued_book_ids = prep_crawl_heapq(library_df)
+    asyncio.run(run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids))
 
 
 if __name__ == "__main__":
