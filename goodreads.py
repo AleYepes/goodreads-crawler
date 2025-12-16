@@ -14,25 +14,57 @@ import pandas as pd
 from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 from playwright.async_api import async_playwright, Page, Response, BrowserContext, Route
+from playwright.sync_api import sync_playwright
 
-load_dotenv()
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
 
-CONCURRENCY = 4
-CONTEXT_LIFETIME = 50
-WAIT_ATTEMPTS = 20
-TIMEOUT_MS = 45000
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+def download_library(email, password):
+    
+    def preprocess_library():
+        df = pd.read_csv(LIBRARY_PATH)
+        df.columns = [col.lower().replace(' ','_') for col in df.columns]
+        return df
 
-# Serialization Helpers
-def serialize_similar(sim_list: List[Dict[str, Any]]) -> str:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context(viewport={"width": 1280, "height": 800}, accept_downloads=True)
+        page = context.new_page()
+        
+        # Log in
+        page.goto("https://www.goodreads.com/ap/signin?language=en_US&openid.assoc_handle=amzn_goodreads_web_na&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.mode=checkid_setup&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.goodreads.com%2Fap-handler%2Fsign-in")
+        page.fill('input[type="email"]', email)
+        page.fill('input[type="password"]', password)
+        page.click('input[type="submit"]')
+
+        # Prep export
+        page.wait_for_selector(".homePrimaryColumn", timeout=60000)
+        page.goto("https://www.goodreads.com/review/import", wait_until="domcontentloaded")
+        export_button = page.locator(".js-LibraryExport").first
+        export_button.click()
+        
+        prepped_export_list = page.locator(".fileList")
+        for _ in range(90):
+            if prepped_export_list.count() > 0 and prepped_export_list.locator("a").count() > 0:
+                break
+            page.wait_for_timeout(500)
+        
+        # Export library
+        with page.expect_download() as download_info:
+            prepped_export_list.locator("a").first.click()
+        download_info.value.save_as(LIBRARY_PATH)
+
+        browser.close()
+
+    return preprocess_library()
+
+
+def serialize_similar(sim_list):
     # Format: id:rating:count|id:rating:count
     if not sim_list:
         return ""
     return "|".join(f"{item['id']}:{item['r']}:{item['c']}" for item in sim_list)
 
-def parse_similar(encoded_str: Any) -> List[Dict[str, Any]]:
+
+def parse_similar(encoded_str):
     if pd.isna(encoded_str) or not isinstance(encoded_str, str) or not encoded_str:
         return []
     
@@ -50,68 +82,17 @@ def parse_similar(encoded_str: Any) -> List[Dict[str, Any]]:
     return results
 
 
-class LibraryExporter:
-    def __init__(self, email: str, password: str):
-        self.email = email
-        self.password = password
-
-    def download_library(self) -> pd.DataFrame:
-        from playwright.sync_api import sync_playwright as sync_p
-        
-        today_str = datetime.now().strftime("%d%m%y")
-        filename = f"{today_str}_goodreads_library_export.csv"
-        output_path = DATA_DIR / filename
-        
-        print("    [Exporter] Starting browser for export...")
-        with sync_p() as p:
-            browser = p.chromium.launch(headless=False)
-            context = browser.new_context(viewport={"width": 1280, "height": 800}, accept_downloads=True)
-            page = context.new_page()
-            
-            # Login
-            page.goto("https://www.goodreads.com/ap/signin?language=en_US&openid.assoc_handle=amzn_goodreads_web_na&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.mode=checkid_setup&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.goodreads.com%2Fap-handler%2Fsign-in")
-            page.fill('input[type="email"]', self.email)
-            page.fill('input[type="password"]', self.password)
-            page.click('input[type="submit"]')
-            try:
-                page.wait_for_selector(".homePrimaryColumn", timeout=60000)
-            except Exception:
-                print("    [Error] Login failed or 2FA required. Please handle in browser.")
-            
-            # Navigate to export page
-            page.goto("https://www.goodreads.com/review/import", wait_until="domcontentloaded")
-            export_button = page.locator(".js-LibraryExport").first
-            if export_button.count() > 0:
-                export_button.click()
-            
-            print("    [Exporter] Waiting for export generation...")
-            file_list = page.locator(".fileList")
-            for _ in range(90):
-                if file_list.count() > 0 and file_list.locator("a").count() > 0:
-                    break
-                page.wait_for_timeout(1000)
-            
-            with page.expect_download() as download_info:
-                file_list.locator("a").first.click()
-            
-            download_info.value.save_as(output_path)
-            browser.close()
-            
-        print(f"    [Exporter] Downloaded: {filename}")
-        return pd.read_csv(output_path)
-
-
 class GoodreadsScraper:
     def __init__(self):
         pass
 
-    async def block_media(self, route: Route):
+    async def block_media(self, route):
         if route.request.resource_type in ["image", "media"]:
             await route.abort()
         else:
             await route.continue_()
 
-    def safe_get_author(self, ld: dict) -> str:
+    def safe_get_author(self, ld):
         auth = ld.get("author")
         if isinstance(auth, dict):
             return auth.get("name", "")
@@ -122,7 +103,7 @@ class GoodreadsScraper:
             return str(item)
         return ""
     
-    def clean_description(self, text: Optional[str]) -> str:
+    def clean_description(self, text):
         if not text: return ""
         text = html.unescape(text)
         
@@ -137,9 +118,9 @@ class GoodreadsScraper:
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
-    async def scrape_book(self, context: BrowserContext, book_id: int) -> Tuple[Optional[dict], List[Dict]]:
+    async def scrape_book(self, context, book_id):
 
-        async def handle_response(response: Response):
+        async def handle_response(response):
             if "graphql" in response.url and response.request.method == "POST":
                 try:
                     json_body = await response.json()
@@ -277,28 +258,20 @@ class GoodreadsScraper:
             return None, []
 
 
-def get_latest_export_file() -> Optional[Path]:
-    pattern = str(DATA_DIR / "*_goodreads_library_export.csv")
-    files = glob.glob(pattern)
-    if not files:
-        return None
-    return Path(max(files, key=os.path.getctime))
-
-
-def calculate_priority_score(avg_rating: float, rating_count: int) -> float:
+def calculate_priority_score(avg_rating, rating_count):
     score = avg_rating - (avg_rating - 3) / math.sqrt(rating_count)
     return score
 
 
-async def run_crawler_optimized(start_ids: List[int], output_path: Path):
+async def run_crawler_optimized(start_ids, OUTPUT_PATH):
     visited = set()
     queued_set = set()
     pq = []
 
     # Resume from existing output file
-    if output_path.exists():
+    if OUTPUT_PATH.exists():
         try:
-            df_iter = pd.read_csv(output_path, usecols=['id', 'similar_books'], chunksize=5000)
+            df_iter = pd.read_csv(OUTPUT_PATH, usecols=['id', 'similar_books'], chunksize=5000)
             for chunk in df_iter:
                 visited.update(chunk['id'].dropna().astype(int).tolist())
                 
@@ -306,19 +279,19 @@ async def run_crawler_optimized(start_ids: List[int], output_path: Path):
                 for entry in chunk['similar_books'].dropna():
                     sim_list = parse_similar(entry)
                     for book_node in sim_list:
-                        bid = book_node.get('id')
-                        if bid and bid not in visited and bid not in queued_set:
+                        book_id = book_node.get('id')
+                        if book_id and book_id not in visited and book_id not in queued_set:
                             score = calculate_priority_score(book_node.get('r', 0), book_node.get('c', 0))
-                            heapq.heappush(pq, (-score, bid))
-                            queued_set.add(bid)
+                            heapq.heappush(pq, (-score, book_id))
+                            queued_set.add(book_id)
         except Exception as e:
             print(f"    [Warning] Error reading resume file: {e}")
 
     # Add start IDs to queue
-    for bid in start_ids:
-        if bid not in visited and bid not in queued_set:
-            heapq.heappush(pq, (-10.0, bid))
-            queued_set.add(bid)
+    for book_id in start_ids:
+        if book_id not in visited and book_id not in queued_set:
+            heapq.heappush(pq, (-10.0, book_id))
+            queued_set.add(book_id)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False) # Running headed is required for GraphQL triggers to fire reliably
@@ -333,7 +306,6 @@ async def run_crawler_optimized(start_ids: List[int], output_path: Path):
         pbar = tqdm(total=len(visited) + len(pq), initial=len(visited), unit="book", smoothing=0.01)
         
         active_tasks = set()
-        requests_count = 0
         
         while pq or active_tasks:
             # Fill concurrent task slots
@@ -361,7 +333,6 @@ async def run_crawler_optimized(start_ids: List[int], output_path: Path):
                     book_id = int(task.get_name())
                     visited.add(book_id)
                     pbar.update(1)
-                    requests_count += 1
                     
                     data, similar_meta = task.result()
                     
@@ -385,62 +356,47 @@ async def run_crawler_optimized(start_ids: List[int], output_path: Path):
             # Save batch periodically
             if len(batch_records) >= 20:
                 df = pd.DataFrame(batch_records)
-                is_new = not output_path.exists()
-                df.to_csv(output_path, mode='a', header=is_new, index=False)
+                is_new = not OUTPUT_PATH.exists()
+                df.to_csv(OUTPUT_PATH, mode='a', header=is_new, index=False)
                 batch_records = []
-
-            # # Rotate browser context for memory management
-            # if requests_count >= CONTEXT_LIFETIME:
-            #     await context.close()
-            #     context = await browser.new_context(
-            #         viewport={"width": 1000, "height": 800},
-            #         user_agent=USER_AGENT
-            #     )
-            #     requests_count = 0
 
         # Final save
         if batch_records:
             df = pd.DataFrame(batch_records)
-            is_new = not output_path.exists()
-            df.to_csv(output_path, mode='a', header=is_new, index=False)
+            is_new = not OUTPUT_PATH.exists()
+            df.to_csv(OUTPUT_PATH, mode='a', header=is_new, index=False)
         
         await browser.close()
         pbar.close()
         print("Done.")
 
 
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+LIBRARY_PATH = str(DATA_DIR / "goodreads_library_export.csv")
+OUTPUT_PATH = str(DATA_DIR / "books.csv")
+
+load_dotenv()
+CONCURRENCY = 1
+CONTEXT_LIFETIME = 50
+WAIT_ATTEMPTS = 20
+TIMEOUT_MS = 45000
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--force-download", action="store_true")
-    parser.add_argument("--start-ids", nargs="+", type=int)
-    parser.add_argument("--limit", type=int)
     args = parser.parse_args()
-    
-    output_path = DATA_DIR / "goodreads_books_data.csv"
-    start_ids = []
 
-    if args.start_ids:
-        start_ids = args.start_ids
+    if args.force_download or not glob.glob(LIBRARY_PATH):
+        email = os.getenv("GOODREADS_EMAIL")
+        password = os.getenv("GOODREADS_PASSWORD")
+        library_df = download_library(email, password)
     else:
-        latest_export = get_latest_export_file()
-        if args.force_download or not latest_export:
-            email = os.getenv("GOODREADS_EMAIL")
-            password = os.getenv("GOODREADS_PASSWORD")
-            if not email or not password:
-                print("Error: GOODREADS_EMAIL and GOODREADS_PASSWORD environment variables required.")
-                return
-            exporter = LibraryExporter(email, password)
-            library_df = exporter.download_library()
-        else:
-            print(f"Using export: {latest_export.name}")
-            library_df = pd.read_csv(latest_export)
-        
-        start_ids = library_df['Book Id'].astype(int).tolist()
+        library_df = pd.read_csv(LIBRARY_PATH)
 
-    if args.limit:
-        start_ids = start_ids[:args.limit]
-
-    asyncio.run(run_crawler_optimized(start_ids, output_path))
+    start_ids = library_df['Book Id'].astype(int).tolist()
+    asyncio.run(run_crawler_optimized(start_ids, OUTPUT_PATH))
 
 
 if __name__ == "__main__":
