@@ -8,6 +8,7 @@ import math
 import heapq
 import html
 import csv
+from bs4 import BeautifulSoup
 from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
@@ -125,68 +126,53 @@ async def fetch_book(page, book_id):
         return data
 
     async def extract_dom_data(page, book_data):
+        html_content = await page.content()
+        soup = BeautifulSoup(html_content, "html.parser")
 
-        def clean_description(text):
-            if not text: return ""
-            text = html.unescape(text)
-            
-            # Replace breaks and paragraphs with newlines
-            text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-            text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
-            
-            # Remove remaining tags (<i>, <b>, <p>, etc.)
-            text = re.sub(r'<[^>]+>', '', text)
-            
-            # Normalize whitespace
+        # Stars distribution
+        stars = {}
+        for i in range(1, 6):   
+            label = soup.find(attrs={"data-testid": f"labelTotal-{i}"})
+            if label:
+                text = label.get_text().strip().split()[0]
+                text = text.replace(",", "")
+                stars[f"{i}_star"] = int(text) if text.isdigit() else 0
+            else:
+                stars[f"{i}_star"] = 0
+        book_data.update(stars)
+
+        # Genres
+        genre_nodes = soup.select(".BookPageMetadataSection__genreButton .Button__labelItem")
+        genres = [node.get_text() for node in genre_nodes if node.get_text() != "...more"]
+        book_data['genres'] = "|".join(genres)
+
+        # Series id
+        series_el = soup.select_one("h3.Text__italic a")
+        if series_el and series_el.get('href'):
+            book_data['series'] = series_el['href'].split('/')[-1]
+        else:
+            book_data['series'] = ""
+
+        # Year
+        pub_el = soup.find(attrs={"data-testid": "publicationInfo"})
+        if pub_el:
+            parts = pub_el.get_text().split(", ")
+            book_data['year'] = parts[-1].strip() if parts else ""
+        else:
+            book_data['year'] = ""
+
+        # Description
+        desc_el = soup.select_one("[data-testid='description'] span.Formatted")
+        if not desc_el:
+            desc_el = soup.select_one(".DetailsLayoutRightParagraph__widthConstrained span.Formatted")
+        if desc_el:
+            for br in desc_el.find_all("br"):
+                br.replace_with("\n")
+            text = desc_el.get_text()
             text = re.sub(r'\n{3,}', '\n\n', text)
-            return text.strip()
-
-        dom_data = await page.evaluate("""() => {
-            const stars = {};
-            [5,4,3,2,1].forEach(i => {
-                const el = document.querySelector(`[data-testid='labelTotal-${i}']`);
-                if (el) {
-                    const match = el.innerText.match(/^([\d,]+)/);
-                    const numStr = match ? match[1].replace(/,/g, '') : '0';
-                    stars[`${i}_star`] = parseInt(numStr) || 0;
-                } else {
-                    stars[`${i}_star`] = 0;
-                }
-            });
-
-            const genreNodes = document.querySelectorAll(".BookPageMetadataSection__genreButton .Button__labelItem");
-            const genres = Array.from(genreNodes)
-                .map(el => el.innerText)
-                .filter(t => t !== "...more")
-                .join("|");
-
-            const seriesEl = document.querySelector("h3.Text__italic a");
-            const series = seriesEl && seriesEl.href ? seriesEl.href.split('/').pop() : "";
-
-            const pubEl = document.querySelector("[data-testid='publicationInfo']");
-            let year = "";
-            if (pubEl) {
-                const parts = pubEl.innerText.split(', ');
-                year = parts[parts.length - 1];
-            }
-
-            const descEl = document.querySelector("[data-testid='description'] span.Formatted") || 
-                            document.querySelector(".DetailsLayoutRightParagraph__widthConstrained span.Formatted");
-
-            return { 
-                stars, 
-                genres, 
-                series, 
-                year, 
-                description: descEl ? descEl.innerHTML : "" 
-            };
-        }""")
-
-        book_data.update(dom_data['stars'])
-        book_data['genres'] = dom_data['genres']
-        book_data['series'] = dom_data['series']
-        book_data['year'] = dom_data['year']
-        book_data['description'] = clean_description(dom_data['description'])
+            book_data['description'] = text.strip()
+        else:
+            book_data['description'] = ""
 
         return book_data
 
@@ -212,13 +198,12 @@ async def fetch_book(page, book_id):
                 avg_rating = float(stats.get("averageRating"))
                 rating_count = int(stats.get("ratingsCount"))
                 count_adj_rating = avg_rating - (avg_rating - 3) / math.sqrt(rating_count + 1)
-                similar_books.append(f"{similar_book_id}:{count_adj_rating}")
+                similar_books.append(f"{similar_book_id}:{round(count_adj_rating,2)}")
 
         book_data["similar_books"] = "|".join(similar_books)
         return book_data
 
     page.on("response", handle_response)
-
     try:
         url = f"https://www.goodreads.com/book/show/{book_id}"
         await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
