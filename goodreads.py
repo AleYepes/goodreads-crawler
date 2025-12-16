@@ -19,50 +19,38 @@ load_dotenv()
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# Running HEADED is required for Goodreads GraphQL triggers to fire reliably
 CONCURRENCY = 4
 CONTEXT_LIFETIME = 50
+WAIT_ATTEMPTS = 20
 TIMEOUT_MS = 45000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # Serialization Helpers
-
 def serialize_similar(sim_list: List[Dict[str, Any]]) -> str:
-    """
-    Compacts similar books into a pipe-delimited string.
-    Format: ID:RATING:COUNT|ID:RATING:COUNT
-    Example: 12345:4.5:100|67890:3.8:500
-    """
+    # Format: id:rating:count|id:rating:count
     if not sim_list:
         return ""
     return "|".join(f"{item['id']}:{item['r']}:{item['c']}" for item in sim_list)
 
 def parse_similar(encoded_str: Any) -> List[Dict[str, Any]]:
-    """
-    Parses the compact string back into a list of dictionaries.
-    Robust against NaNs or malformed strings.
-    """
     if pd.isna(encoded_str) or not isinstance(encoded_str, str) or not encoded_str:
         return []
     
     results = []
     for item in encoded_str.split("|"):
         parts = item.split(":")
-        if len(parts) == 3:
-            try:
-                results.append({
-                    "id": int(parts[0]),
-                    "r": float(parts[1]),
-                    "c": int(parts[2])
-                })
-            except ValueError:
-                continue
+        try:
+            results.append({
+                "id": int(parts[0]),
+                "r": float(parts[1]),
+                "c": int(parts[2])
+            })
+        except ValueError:
+            continue
     return results
 
 
-class GoodreadsExporter:
-    """Handles logging in and downloading the initial library export."""
-    
+class LibraryExporter:
     def __init__(self, email: str, password: str):
         self.email = email
         self.password = password
@@ -117,13 +105,13 @@ class GoodreadsScraper:
     def __init__(self):
         pass
 
-    async def _block_media(self, route: Route):
+    async def block_media(self, route: Route):
         if route.request.resource_type in ["image", "media"]:
             await route.abort()
         else:
             await route.continue_()
 
-    def _safe_get_author(self, ld: dict) -> str:
+    def safe_get_author(self, ld: dict) -> str:
         auth = ld.get("author")
         if isinstance(auth, dict):
             return auth.get("name", "")
@@ -134,7 +122,7 @@ class GoodreadsScraper:
             return str(item)
         return ""
     
-    def _clean_description(self, text: Optional[str]) -> str:
+    def clean_description(self, text: Optional[str]) -> str:
         if not text: return ""
         text = html.unescape(text)
         
@@ -150,8 +138,6 @@ class GoodreadsScraper:
         return text.strip()
 
     async def scrape_book(self, context: BrowserContext, book_id: int) -> Tuple[Optional[dict], List[Dict]]:
-        page = await context.new_page()
-        captured_payloads = []
 
         async def handle_response(response: Response):
             if "graphql" in response.url and response.request.method == "POST":
@@ -161,21 +147,18 @@ class GoodreadsScraper:
                 except Exception:
                     pass
 
+        captured_payloads = []
+        page = await context.new_page()
         page.on("response", handle_response)
-        await page.route("**/*", self._block_media)
+        await page.route("**/*", self.block_media)
 
         url = f"https://www.goodreads.com/book/show/{book_id}"
-        
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-            
-            # Close sign-up popup if present
-            try:
-                close_btn = page.locator(".Overlay__close button").first
-                if await close_btn.is_visible():
-                    await close_btn.click()
-            except Exception:
-                pass
+
+            close_btn = page.locator(".Overlay__close button").first
+            if await close_btn.is_visible():
+                await close_btn.click()
 
             # Extract JSON-LD metadata
             script_locator = page.locator('script[type="application/ld+json"]').first
@@ -187,14 +170,12 @@ class GoodreadsScraper:
                 await page.close()
                 return None, []
 
-            if isinstance(ld, list):
-                ld = next((item for item in ld if isinstance(item, dict) and item.get("@type") == "Book"), {})
-            
+            ld = next((item for item in ld if isinstance(item, dict) and item.get("@type") == "Book"), {})
             agg_rating = ld.get("aggregateRating", {})
             data = {
                 "id": book_id,
                 "title": html.unescape(ld.get("name", "")),
-                "author": self._safe_get_author(ld),
+                "author": self.safe_get_author(ld),
                 "avg_rating": agg_rating.get("ratingValue"),
                 "total_reviews": agg_rating.get("reviewCount"),
                 "pages": ld.get("numberOfPages"),
@@ -247,11 +228,11 @@ class GoodreadsScraper:
             data['genres'] = dom_data['genres']
             data['series'] = dom_data['series']
             data['year'] = dom_data['year']
-            data['description'] = self._clean_description(dom_data['description'])
+            data['description'] = self.clean_description(dom_data['description'])
 
             # Wait for similar books GraphQL response
             wait_attempts = 0
-            while not any("getSimilarBooks" in str(p) for p in captured_payloads) and wait_attempts < 5:
+            while not any("getSimilarBooks" in str(p) for p in captured_payloads) and wait_attempts < WAIT_ATTEMPTS:
                 await page.wait_for_timeout(500)
                 wait_attempts += 1
             
@@ -284,9 +265,8 @@ class GoodreadsScraper:
                         
                         similar_books_meta[sim_id] = {"id": sim_id, "r": rating, "c": count}
 
+            page.remove_listener("response", handle_response)
             final_similar = list(similar_books_meta.values())
-            
-            # Changed from JSON dumps to Custom Serialize
             data["similar_books"] = serialize_similar(final_similar)
             
             await page.close()
@@ -306,11 +286,7 @@ def get_latest_export_file() -> Optional[Path]:
 
 
 def calculate_priority_score(avg_rating: float, rating_count: int) -> float:
-    """Calculate priority score for crawl queue."""
-    if rating_count < 1:
-        return -100.0
-    log_val = math.log1p(rating_count)
-    score = avg_rating - (avg_rating - 3) / log_val
+    score = avg_rating - (avg_rating - 3) / math.sqrt(rating_count)
     return score
 
 
@@ -321,7 +297,6 @@ async def run_crawler_optimized(start_ids: List[int], output_path: Path):
 
     # Resume from existing output file
     if output_path.exists():
-        print(f"Resuming from {output_path}...")
         try:
             df_iter = pd.read_csv(output_path, usecols=['id', 'similar_books'], chunksize=5000)
             for chunk in df_iter:
@@ -329,9 +304,7 @@ async def run_crawler_optimized(start_ids: List[int], output_path: Path):
                 
                 # Rebuild frontier from similar books
                 for entry in chunk['similar_books'].dropna():
-                    # Changed from JSON loads to Custom Parse
                     sim_list = parse_similar(entry)
-                    
                     for book_node in sim_list:
                         bid = book_node.get('id')
                         if bid and bid not in visited and bid not in queued_set:
@@ -347,10 +320,8 @@ async def run_crawler_optimized(start_ids: List[int], output_path: Path):
             heapq.heappush(pq, (-10.0, bid))
             queued_set.add(bid)
 
-    print(f"    Queue Size: {len(pq)} | Visited: {len(visited)}")
-    
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(headless=False) # Running headed is required for GraphQL triggers to fire reliably
         scraper = GoodreadsScraper()
         
         context = await browser.new_context(
@@ -418,14 +389,14 @@ async def run_crawler_optimized(start_ids: List[int], output_path: Path):
                 df.to_csv(output_path, mode='a', header=is_new, index=False)
                 batch_records = []
 
-            # Rotate browser context for memory management
-            if requests_count >= CONTEXT_LIFETIME:
-                await context.close()
-                context = await browser.new_context(
-                    viewport={"width": 1000, "height": 800},
-                    user_agent=USER_AGENT
-                )
-                requests_count = 0
+            # # Rotate browser context for memory management
+            # if requests_count >= CONTEXT_LIFETIME:
+            #     await context.close()
+            #     context = await browser.new_context(
+            #         viewport={"width": 1000, "height": 800},
+            #         user_agent=USER_AGENT
+            #     )
+            #     requests_count = 0
 
         # Final save
         if batch_records:
@@ -458,7 +429,7 @@ def main():
             if not email or not password:
                 print("Error: GOODREADS_EMAIL and GOODREADS_PASSWORD environment variables required.")
                 return
-            exporter = GoodreadsExporter(email, password)
+            exporter = LibraryExporter(email, password)
             library_df = exporter.download_library()
         else:
             print(f"Using export: {latest_export.name}")
