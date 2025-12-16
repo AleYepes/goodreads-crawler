@@ -95,19 +95,13 @@ def prep_crawl_heapq(library_df):
     return id_scraping_queue, scraped_book_ids, queued_book_ids
 
 
-async def fetch_book(context, book_id):
+async def fetch_book(page, book_id):
     captured_payloads = []
 
     async def handle_response(response):
         if "graphql" in response.url and response.request.method == "POST":
             json_body = await response.json()
             captured_payloads.append(json_body)
-
-    async def block_media(route):
-        if route.request.resource_type in ["image", "media", "font"]:
-            await route.abort()
-        else:
-            await route.continue_()
 
     async def extract_linked_data_basics(page, book_id):
         script_locator = page.locator('script[type="application/ld+json"]').first
@@ -201,7 +195,6 @@ async def fetch_book(context, book_id):
         while not any("getSimilarBooks" in str(p) for p in captured_payloads) and wait_attempts < PAYLOAD_WAIT_ATTEMPTS:
             await page.wait_for_timeout(500)
             wait_attempts += 1
-        page.remove_listener("response", handle_response) ####
         
         similar_books = []
         for payload in captured_payloads:
@@ -224,13 +217,12 @@ async def fetch_book(context, book_id):
         book_data["similar_books"] = "|".join(similar_books)
         return book_data
 
-    page = await context.new_page()
     page.on("response", handle_response)
-    await page.route("**/*", block_media)
 
     try:
         url = f"https://www.goodreads.com/book/show/{book_id}"
         await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+
         modal_close_btn = page.locator(".Overlay__close button").first
         if await modal_close_btn.is_visible():
             await modal_close_btn.click()
@@ -245,10 +237,26 @@ async def fetch_book(context, book_id):
         tqdm.write(f"Task Failed: {e}")
         return None
     finally:
-        await page.close()
+        page.remove_listener("response", handle_response)
+        await page.goto("about:blank")
 
 
 async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
+
+    async def block_media(route):
+        if route.request.resource_type in ["image", "media", "font"]:
+            await route.abort()
+        else:
+            await route.continue_()
+
+    async def process_book_wrapper(page, book_id, page_pool):
+        try:
+            result = await fetch_book(page, book_id)
+            return result
+        finally:
+            # RETURN PAGE TO POOL
+            await page_pool.put(page)
+
     file_exists = OUTPUT_PATH.exists()
     field_names = [
         "book_id", "title", "authors", "avg_rating", "review_count", 
@@ -258,23 +266,30 @@ async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
 
     with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=field_names)
-
         if not file_exists:
             writer.writeheader()
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=False) # Seems that running headed is required for GraphQL triggers to fire
             context = await browser.new_context(user_agent=USER_AGENT)
-            pbar = tqdm(total=len(scraped_book_ids) + len(id_scraping_queue), initial=len(scraped_book_ids))
-            
+            await context.route("**/*", block_media)
+
+            page_pool = asyncio.Queue()
+            for _ in range(CONCURRENCY):
+                pg = await context.new_page()
+                page_pool.put_nowait(pg)
+
             active_tasks = set()
+            pbar = tqdm(total=len(scraped_book_ids) + len(id_scraping_queue), initial=len(scraped_book_ids))
             while id_scraping_queue or active_tasks:
-                while len(active_tasks) < CONCURRENCY and queued_book_ids:
+                while id_scraping_queue and not page_pool.empty():
                     _, current_id = heapq.heappop(id_scraping_queue)
                     if current_id in scraped_book_ids:
                         continue
+
+                    page = page_pool.get_nowait()
                     
-                    task = asyncio.create_task(fetch_book(context, current_id))
+                    task = asyncio.create_task(process_book_wrapper(page, current_id, page_pool))
                     active_tasks.add(task)
                 if not active_tasks:
                     break
@@ -293,6 +308,7 @@ async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
                         for similar_book_id, count_adj_rating in similar_books:
                             if similar_book_id not in scraped_book_ids and similar_book_id not in queued_book_ids:
                                 heapq.heappush(id_scraping_queue, (-count_adj_rating, similar_book_id))
+                                queued_book_ids.add(similar_book_id)
                                 added_count += 1
                         pbar.total += added_count
 
@@ -306,17 +322,17 @@ LIBRARY_PATH = DATA_DIR / "goodreads_library_export.csv"
 OUTPUT_PATH = DATA_DIR / "books.csv"
 
 load_dotenv()
-CONCURRENCY = 1
+CONCURRENCY = 2
 PAYLOAD_WAIT_ATTEMPTS = 20
 PAGE_TIMEOUT_MS = 30000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--force-download", action="store_true")
+    parser.add_argument("--fd", action="store_true")
     args = parser.parse_args()
 
-    if args.force_download or not glob.glob(LIBRARY_PATH):
+    if args.fd or not glob.glob(str(LIBRARY_PATH)):
         email = os.getenv("GOODREADS_EMAIL")
         password = os.getenv("GOODREADS_PASSWORD")
         library_df = download_library(email, password)
