@@ -7,13 +7,11 @@ import glob
 import math
 import heapq
 import html
-from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
 import pandas as pd
 from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
-from playwright.async_api import async_playwright, Page, Response, BrowserContext, Route
+from playwright.async_api import async_playwright
 from playwright.sync_api import sync_playwright
 
 
@@ -61,18 +59,11 @@ def parse_similar_books_string(encoded_str):
     if not isinstance(encoded_str, str):
         return []
     
-    results = []
+    similar_books = []
     for item in encoded_str.split("|"):
-        parts = item.split(":")
-        try:
-            results.append({
-                "book_id": int(parts[0]),
-                "avg_rating": float(parts[1]),
-                "rating_count": int(parts[2])
-            })
-        except ValueError:
-            continue
-    return results
+        book_id, avg_rating, rating_count = item.split(":")
+        similar_books.append((book_id, avg_rating, rating_count))
+    return similar_books
 
 
 def calculate_priority_score(avg_rating, rating_count):
@@ -87,22 +78,21 @@ def prep_crawl_heapq(library_df):
     id_scraping_queue = []
     seed_book_ids = library_df['book_id'].astype(int).tolist()
 
+    # Find scraped and remaining books from previous crawling output
     if OUTPUT_PATH.exists():
         df_iter = pd.read_csv(OUTPUT_PATH, usecols=['id', 'similar_books'], chunksize=5000)
         for chunk in df_iter:
             scraped_book_ids.update(chunk['id'].dropna().astype(int).tolist())
             
-            # Find remaining books in similar_books column
             for entry in chunk['similar_books'].dropna():
-                sim_list = parse_similar_books_string(entry)
-                for book_node in sim_list:
-                    book_id = book_node.get('id')
-                    if book_id and book_id not in scraped_book_ids and book_id not in remaining_book_ids:
-                        score = calculate_priority_score(book_node.get('avg_rating', 0), book_node.get('rating_count', 0))
+                similar_books = parse_similar_books_string(entry)
+                for book_id, avg_rating, rating_count in similar_books:
+                    if book_id not in scraped_book_ids and book_id not in remaining_book_ids:
+                        score = calculate_priority_score(avg_rating, rating_count)
                         heapq.heappush(id_scraping_queue, (-score, book_id))
                         remaining_book_ids.add(book_id)
 
-    # Find remaining books in library
+    # Find remaining books from library export
     for book_id in seed_book_ids:
         if book_id not in scraped_book_ids and book_id not in remaining_book_ids:
             heapq.heappush(id_scraping_queue, (-10.0, book_id)) # -10 prioritizes seed ids before all others on the queue
@@ -116,24 +106,6 @@ def serialize_similar(sim_list):
     if not sim_list:
         return ""
     return "|".join(f"{item['id']}:{item['r']}:{item['c']}" for item in sim_list)
-
-
-def parse_similar_books_string(encoded_str):
-    if pd.isna(encoded_str) or not isinstance(encoded_str, str) or not encoded_str:
-        return []
-    
-    results = []
-    for item in encoded_str.split("|"):
-        parts = item.split(":")
-        try:
-            results.append({
-                "id": int(parts[0]),
-                "r": float(parts[1]),
-                "c": int(parts[2])
-            })
-        except ValueError:
-            continue
-    return results
 
 
 async def block_media(self, route):
