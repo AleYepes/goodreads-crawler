@@ -7,6 +7,7 @@ import glob
 import math
 import heapq
 import html
+import csv
 from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
@@ -25,7 +26,7 @@ def download_library(email, password):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
-        context = browser.new_context(viewport={"width": 1280, "height": 800}, accept_downloads=True)
+        context = browser.new_context(viewport={"width": 1280, "height": 800}, user_agent=USER_AGENT, accept_downloads=True)
         page = context.new_page()
         
         # Log in
@@ -41,7 +42,7 @@ def download_library(email, password):
         export_button.click()
         
         prepped_export_list = page.locator(".fileList")
-        for _ in range(90):
+        for _ in range(120):
             if prepped_export_list.count() > 0 and prepped_export_list.locator("a").count() > 0:
                 break
             page.wait_for_timeout(500)
@@ -61,20 +62,13 @@ def parse_similar_books_string(encoded_str):
     
     similar_books = []
     for item in encoded_str.split("|"):
-        book_id, avg_rating, rating_count = item.split(":")
-        similar_books.append((book_id, avg_rating, rating_count))
+        book_id, count_adj_rating = item.split(":")
+        similar_books.append((int(book_id), float(count_adj_rating)))
     return similar_books
-
-
-def calculate_priority_score(avg_rating, rating_count):
-    # Count adjusted rating as score
-    score = avg_rating - (avg_rating - 3) / math.sqrt(rating_count + 1)
-    return score
 
 
 def prep_crawl_heapq(library_df):
     scraped_book_ids = set()
-    remaining_book_ids = set()
     id_scraping_queue = []
     seed_book_ids = library_df['book_id'].astype(int).tolist()
 
@@ -86,109 +80,69 @@ def prep_crawl_heapq(library_df):
             
             for entry in chunk['similar_books'].dropna():
                 similar_books = parse_similar_books_string(entry)
-                for book_id, avg_rating, rating_count in similar_books:
-                    if book_id not in scraped_book_ids and book_id not in remaining_book_ids:
-                        score = calculate_priority_score(avg_rating, rating_count)
-                        heapq.heappush(id_scraping_queue, (-score, book_id))
-                        remaining_book_ids.add(book_id)
+                for book_id, count_adj_rating in similar_books:
+                    if book_id not in scraped_book_ids and book_id not in id_scraping_queue:
+                        heapq.heappush(id_scraping_queue, (-count_adj_rating, book_id))
 
     # Find remaining books from library export
     for book_id in seed_book_ids:
-        if book_id not in scraped_book_ids and book_id not in remaining_book_ids:
-            heapq.heappush(id_scraping_queue, (-10.0, book_id)) # -10 prioritizes seed ids before all others on the queue
-            remaining_book_ids.add(book_id)
+        if book_id not in scraped_book_ids and book_id not in id_scraping_queue:
+            heapq.heappush(id_scraping_queue, (-5.0, book_id)) # -5 max theoretical count_adj_rating to prioritize seed ids before others on the queue
 
-    return id_scraping_queue, scraped_book_ids, remaining_book_ids
-
-
-def serialize_similar(sim_list):
-    # Format: id:rating:count|id:rating:count
-    if not sim_list:
-        return ""
-    return "|".join(f"{item['id']}:{item['r']}:{item['c']}" for item in sim_list)
+    return id_scraping_queue, scraped_book_ids
 
 
-async def block_media(self, route):
-    if route.request.resource_type in ["image", "media"]:
-        await route.abort()
-    else:
-        await route.continue_()
-
-
-def safe_get_author(self, ld):
-    auth = ld.get("author")
-    if isinstance(auth, dict):
-        return auth.get("name", "")
-    if isinstance(auth, list) and auth:
-        item = auth[0]
-        if isinstance(item, dict):
-            return item.get("name", "")
-        return str(item)
-    return ""
-
-
-def clean_description(self, text):
-    if not text: return ""
-    text = html.unescape(text)
-    
-    # Replace breaks and paragraphs with newlines
-    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
-    
-    # Remove remaining tags (<i>, <b>, <p>, etc.)
-    text = re.sub(r'<[^>]+>', '', text)
-    
-    # Normalize whitespace
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
-
-
-async def scrape_book(self, context, book_id):
+async def fetch_book(context, book_id):
 
     async def handle_response(response):
         if "graphql" in response.url and response.request.method == "POST":
-            try:
-                json_body = await response.json()
-                captured_payloads.append(json_body)
-            except Exception:
-                pass
+            json_body = await response.json()
+            captured_payloads.append(json_body)
 
-    captured_payloads = []
-    page = await context.new_page()
-    page.on("response", handle_response)
-    await page.route("**/*", self.block_media)
+    async def block_media(route):
+        if route.request.resource_type in ["image", "media"]:
+            await route.abort()
+        else:
+            await route.continue_()
 
-    url = f"https://www.goodreads.com/book/show/{book_id}"
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-
-        close_btn = page.locator(".Overlay__close button").first
-        if await close_btn.is_visible():
-            await close_btn.click()
-
-        # Extract JSON-LD metadata
+    async def extract_linked_data_basics(page, book_id):
         script_locator = page.locator('script[type="application/ld+json"]').first
-        try:
-            await script_locator.wait_for(state="attached", timeout=5000)
-            content = await script_locator.text_content()
-            ld = json.loads(content)
-        except Exception:
-            await page.close()
-            return None, []
+        await script_locator.wait_for(state="attached", timeout=5000)
+        content = await script_locator.text_content()
+        ld = json.loads(content)
 
-        ld = next((item for item in ld if isinstance(item, dict) and item.get("@type") == "Book"), {})
         agg_rating = ld.get("aggregateRating", {})
+        title = html.unescape(ld.get("name", ""))
+        authors = "|".join(a["name"] for a in ld.get("author", []) if "name" in a)
         data = {
-            "id": book_id,
-            "title": html.unescape(ld.get("name", "")),
-            "author": self.safe_get_author(ld),
+            "book_id": book_id,
+            "title": title,
+            "authors": authors,
             "avg_rating": agg_rating.get("ratingValue"),
-            "total_reviews": agg_rating.get("reviewCount"),
-            "pages": ld.get("numberOfPages"),
+            "review_count": agg_rating.get("reviewCount"),
+            "num_pages": ld.get("numberOfPages"),
             "lang": ld.get("inLanguage"),
         }
 
-        # Extract DOM data via JavaScript evaluation
+        return data
+
+    async def extract_dom_data(page, book_data):
+
+        def clean_description(text):
+            if not text: return ""
+            text = html.unescape(text)
+            
+            # Replace breaks and paragraphs with newlines
+            text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+            text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
+            
+            # Remove remaining tags (<i>, <b>, <p>, etc.)
+            text = re.sub(r'<[^>]+>', '', text)
+            
+            # Normalize whitespace
+            text = re.sub(r'\n{3,}', '\n\n', text)
+            return text.strip()
+
         dom_data = await page.evaluate("""() => {
             const stars = {};
             [5,4,3,2,1].forEach(i => {
@@ -229,124 +183,120 @@ async def scrape_book(self, context, book_id):
                 description: descEl ? descEl.innerHTML : "" 
             };
         }""")
-        
-        data.update(dom_data['stars'])
-        data['genres'] = dom_data['genres']
-        data['series'] = dom_data['series']
-        data['year'] = dom_data['year']
-        data['description'] = self.clean_description(dom_data['description'])
 
-        # Wait for similar books GraphQL response
+        book_data.update(dom_data['stars'])
+        book_data['genres'] = dom_data['genres']
+        book_data['series'] = dom_data['series']
+        book_data['year'] = dom_data['year']
+        book_data['description'] = clean_description(dom_data['description'])
+
+        return book_data
+
+    async def extract_similar_books_json(page, book_data, captured_payloads):
         wait_attempts = 0
-        while not any("getSimilarBooks" in str(p) for p in captured_payloads) and wait_attempts < WAIT_ATTEMPTS:
+        while not any("getSimilarBooks" in str(p) for p in captured_payloads) and wait_attempts < PAYLOAD_WAIT_ATTEMPTS:
             await page.wait_for_timeout(500)
             wait_attempts += 1
-        
-        similar_books_meta = {}
-        for payload in captured_payloads:
-            data_block = payload.get("data", {})
-            if not data_block:
-                continue
-            conn = data_block.get("getSimilarBooks", {})
-            edges = conn.get("edges", []) if isinstance(conn, dict) else []
-            
-            for edge in edges:
-                node = edge.get("node", {})
-                web_url = node.get("webUrl", "")
-                
-                sim_id = None
-                if web_url:
-                    match = re.search(r'show/(\d+)', web_url)
-                    if match:
-                        sim_id = int(match.group(1))
-                
-                if sim_id:
-                    work = node.get("work", {})
-                    stats = work.get("stats", {}) if work else {}
-                    try:
-                        rating = float(stats.get("averageRating") or 0)
-                        count = int(stats.get("ratingsCount") or 0)
-                    except (ValueError, TypeError):
-                        rating, count = 0.0, 0
-                    
-                    similar_books_meta[sim_id] = {"id": sim_id, "r": rating, "c": count}
-
         page.remove_listener("response", handle_response)
-        final_similar = list(similar_books_meta.values())
-        data["similar_books"] = serialize_similar(final_similar)
         
-        await page.close()
-        return data, final_similar
+        similar_books = []
+        for payload in captured_payloads:
+            data_block = payload.get("data", {}).get("getSimilarBooks", {})
+            similar_books_raw = data_block.get("edges", [])
+            
+            for book_edge in similar_books_raw:
+                book_node = book_edge.get("node", {})
 
-    except Exception:
-        await page.close()
-        return None, []
-
-
-async def run_crawler(id_scraping_queue, scraped_book_ids, remaining_book_ids):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False) # Running headed is required for GraphQL triggers to fire reliably
-        context = await browser.new_context()
-        batch_records = []
-        pbar = tqdm(total=len(scraped_book_ids) + len(id_scraping_queue), initial=len(scraped_book_ids))
-        
-        active_tasks = set()
-        while id_scraping_queue or active_tasks:
-            while len(active_tasks) < CONCURRENCY and id_scraping_queue:
-                _, current_id = heapq.heappop(id_scraping_queue)
-                if current_id in remaining_book_ids:
-                    remaining_book_ids.remove(current_id)
-                if current_id in scraped_book_ids:
-                    continue
+                web_url = book_node.get("webUrl", "")
+                match = re.search(r'show/(\d+)', web_url)
+                similar_book_id = int(match.group(1))
                 
-                task = asyncio.create_task(scrape_book(context, current_id))
-                task.set_name(str(current_id))
-                active_tasks.add(task)
-                pbar.set_description(f"Q: {len(id_scraping_queue)} | Act: {len(active_tasks)}")
-            if not active_tasks:
-                break
+                stats = book_node.get("work").get("stats", {})
+                avg_rating = float(stats.get("averageRating"))
+                rating_count = int(stats.get("ratingsCount"))
+                count_adj_rating = avg_rating - (avg_rating - 3) / math.sqrt(rating_count + 1)
+                similar_books.append(f"{similar_book_id}:{count_adj_rating}")
 
-            done, active_tasks = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                try:
-                    book_id = int(task.get_name())
-                    scraped_book_ids.add(book_id)
-                    pbar.update(1)
+        similar_books = "|".join(similar_books)
+        book_data["similar_books"] = similar_books
+
+        return book_data
+
+    page = await context.new_page()
+    captured_payloads = []
+    page.on("response", handle_response)
+    await page.route("**/*", block_media)
+
+    try:
+        url = f"https://www.goodreads.com/book/show/{book_id}"
+        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        modal_close_btn = page.locator(".Overlay__close button").first
+        if await modal_close_btn.is_visible():
+            await modal_close_btn.click()
+
+        book_data = await extract_linked_data_basics(page, book_id)
+        book_data = await extract_dom_data(page, book_data)
+        book_data = await extract_similar_books_json(page, book_data, captured_payloads)
+
+        return book_data
+
+    except Exception as e:
+        tqdm.write(f"Task Failed: {e}")
+        return None
+    finally:
+        await page.close()
+
+
+async def run_crawler(id_scraping_queue, scraped_book_ids):
+    file_exists = OUTPUT_PATH.exists()
+    field_names = [
+        "book_id", "title", "authors", "avg_rating", "review_count", 
+        "num_pages", "lang", "1_star", "2_star", "3_star", "4_star", 
+        "5_star", "genres", "series", "year", "description", "similar_books"
+    ]
+
+    with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=field_names)
+
+        if not file_exists:
+            writer.writeheader()
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False) # Seems that running headed is required for GraphQL triggers to fire
+            context = await browser.new_context(user_agent=USER_AGENT)
+            pbar = tqdm(total=len(scraped_book_ids) + len(id_scraping_queue), initial=len(scraped_book_ids))
+            
+            active_tasks = set()
+            while id_scraping_queue or active_tasks:
+                while len(active_tasks) < CONCURRENCY and id_scraping_queue:
+                    _, current_id = heapq.heappop(id_scraping_queue)
+                    if current_id in scraped_book_ids:
+                        continue
                     
-                    data, similar_meta = task.result()
+                    task = asyncio.create_task(fetch_book(context, current_id))
+                    active_tasks.add(task)
+                if not active_tasks:
+                    break
+
+                done, active_tasks = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    book_data = task.result()
+                    if book_data:
+                        writer.writerow(book_data)
+                        f.flush()
+                        scraped_book_ids.add(book_data['book_id'])
+                        pbar.update(1)
                     
-                    if data:
-                        batch_records.append(data)
-                        
-                        # Add similar books to queue
+                        similar_books = parse_similar_books_string(book_data.get('similar_books'))
                         added_count = 0
-                        for sim in similar_meta:
-                            sid = sim['id']
-                            if sid not in scraped_book_ids and sid not in remaining_book_ids:
-                                score = calculate_priority_score(sim['r'], sim['c'])
-                                heapq.heappush(id_scraping_queue, (-score, sid))
-                                remaining_book_ids.add(sid)
+                        for similar_book_id, count_adj_rating in similar_books:
+                            if similar_book_id not in scraped_book_ids and similar_book_id not in id_scraping_queue:
+                                heapq.heappush(id_scraping_queue, (-count_adj_rating, similar_book_id))
                                 added_count += 1
                         pbar.total += added_count
-                        
-                except Exception as e:
-                    tqdm.write(f"Task Failed: {e}")
 
-            # Save batch periodically
-            if len(batch_records) >= 20:
-                df = pd.DataFrame(batch_records)
-                is_new = not OUTPUT_PATH.exists()
-                df.to_csv(OUTPUT_PATH, mode='a', header=is_new, index=False)
-                batch_records = []
-
-        # Final save
-        if batch_records:
-            df = pd.DataFrame(batch_records)
-            is_new = not OUTPUT_PATH.exists()
-            df.to_csv(OUTPUT_PATH, mode='a', header=is_new, index=False)
-        
-        await browser.close()
-        pbar.close()
+            pbar.close()
+            await browser.close()
 
 
 DATA_DIR = Path("data")
@@ -356,9 +306,8 @@ OUTPUT_PATH = DATA_DIR / "books.csv"
 
 load_dotenv()
 CONCURRENCY = 1
-CONTEXT_LIFETIME = 50
-WAIT_ATTEMPTS = 20
-TIMEOUT_MS = 45000
+PAYLOAD_WAIT_ATTEMPTS = 20
+PAGE_TIMEOUT_MS = 30000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def main():
@@ -373,8 +322,8 @@ def main():
     else:
         library_df = pd.read_csv(LIBRARY_PATH)
 
-    id_scraping_queue, scraped_book_ids, remaining_book_ids = prep_crawl_heapq(library_df)
-    asyncio.run(run_crawler(id_scraping_queue, scraped_book_ids, remaining_book_ids))
+    id_scraping_queue, scraped_book_ids = prep_crawl_heapq(library_df)
+    asyncio.run(run_crawler(id_scraping_queue, scraped_book_ids))
 
 
 if __name__ == "__main__":
