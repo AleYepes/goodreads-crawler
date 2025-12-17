@@ -7,6 +7,7 @@ import glob
 import heapq
 import html
 import csv
+import math
 import pandas as pd
 import numpy as np
 import traceback
@@ -111,7 +112,7 @@ async def fetch_book(page, book_id):
 
     async def extract_linked_data_basics(page, book_id):
         script_locator = page.locator('script[type="application/ld+json"]').first
-        await script_locator.wait_for(state="attached", timeout=5000)
+        await script_locator.wait_for(state="attached", timeout=PAGE_TIMEOUT_MS)
         content = await script_locator.text_content()
         ld = json.loads(content)
 
@@ -221,7 +222,7 @@ async def fetch_book(page, book_id):
         if await modal_close_btn.is_visible():
             await modal_close_btn.click()
 
-        await page.evaluate("window.scrollBy(0, 100)")
+        await page.evaluate(f"window.scrollBy(0, {math.randint(100,200)})")
 
         book_data = await extract_linked_data_basics(page, book_id)
         book_data = await extract_dom_data(page, book_data)
@@ -231,7 +232,7 @@ async def fetch_book(page, book_id):
 
     except Exception as e:
         if "Target closed" not in str(e):
-             tqdm.write(f"Task Failed for {book_id}: {e}")
+             tqdm.write(f"Task Failed for {book_id} -- {e}")
         return None
     finally:
         collecting = False
@@ -334,7 +335,7 @@ OUTPUT_PATH = DATA_DIR / "books.csv"
 load_dotenv()
 CONCURRENCY = 3
 PAYLOAD_WAIT_ATTEMPTS = 20
-PAGE_TIMEOUT_MS = 30000
+PAGE_TIMEOUT_MS = 10000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def main():
