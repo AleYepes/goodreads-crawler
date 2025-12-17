@@ -75,17 +75,20 @@ def prep_crawl_heapq(library_df):
     seed_book_ids = library_df['book_id'].dropna().astype(int).tolist()
 
     # Load existing progress
-    if OUTPUT_PATH.exists():
-        df_iter = pd.read_csv(OUTPUT_PATH, usecols=['book_id', 'similar_books'], chunksize=5000)
-        for chunk in df_iter:
-            scraped_book_ids.update(chunk['book_id'].dropna().astype(int).tolist())
-            
-            for similar_books_string in chunk['similar_books'].dropna():
-                similar_books = parse_similar_books_string(similar_books_string)
-                for book_id, count_adj_rating in similar_books:
-                    if book_id not in scraped_book_ids and book_id not in id_scraping_queue:
-                        heapq.heappush(id_scraping_queue, (-count_adj_rating, book_id))
-                        queued_book_ids.add(book_id)
+    try:
+        if OUTPUT_PATH.exists():
+            df_iter = pd.read_csv(OUTPUT_PATH, usecols=['book_id', 'similar_books'], chunksize=5000, on_bad_lines='skip')
+            for chunk in df_iter:
+                scraped_book_ids.update(chunk['book_id'].dropna().astype(int).tolist())
+                
+                for similar_books_string in chunk['similar_books'].dropna():
+                    similar_books = parse_similar_books_string(similar_books_string)
+                    for book_id, count_adj_rating in similar_books:
+                        if book_id not in scraped_book_ids and book_id not in id_scraping_queue:
+                            heapq.heappush(id_scraping_queue, (-count_adj_rating, book_id))
+                            queued_book_ids.add(book_id)
+    except Exception as e:
+        print(f"Error reading CSV, potentially severe corruption: {e}")
 
     # Find remaining books from library export
     for book_id in seed_book_ids:
@@ -234,12 +237,11 @@ async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
         else:
             await route.continue_()
 
-    async def process_book_wrapper(page, book_id, page_pool):
+    async def fetch_book_wrapper(page, book_id, page_pool):
         try:
             result = await fetch_book(page, book_id)
             return result
         finally:
-            # RETURN PAGE TO POOL
             await page_pool.put(page)
 
     file_exists = OUTPUT_PATH.exists()
@@ -274,7 +276,7 @@ async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
 
                     page = page_pool.get_nowait()
                     
-                    task = asyncio.create_task(process_book_wrapper(page, current_id, page_pool))
+                    task = asyncio.create_task(fetch_book_wrapper(page, current_id, page_pool))
                     active_tasks.add(task)
                 if not active_tasks:
                     break
@@ -325,7 +327,10 @@ def main():
         library_df = pd.read_csv(LIBRARY_PATH)
 
     id_scraping_queue, scraped_book_ids, queued_book_ids = prep_crawl_heapq(library_df)
-    asyncio.run(run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids))
+    try:
+        asyncio.run(run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids))
+    except KeyboardInterrupt:
+        print("\nShutdown requested. Progress saved to CSV.")
 
 
 if __name__ == "__main__":
