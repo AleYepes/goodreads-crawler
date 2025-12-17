@@ -1,14 +1,14 @@
 # Goodreads Crawler & Ranker
 
-An async crawler and recommender system that finds good books to read.
+Async crawler and recommender system to find good books to read.
 
 ## Setup 
 1. **Save Books to Your Goodreads Library:**
 
     <img src="assets/button.png" alt="alt text" width="300">
    
-   The books in your library seed the crawler.<br>
-   Books marked as 'Read' are used to train your personal model.
+   Your library seeds the crawler.<br>
+   Books marked as 'Read' train your personal model.
 
 2. **Install Requirements:**
    ```bash
@@ -34,4 +34,4 @@ An async crawler and recommender system that finds good books to read.
     ```bash
     python3 recommend.py
     ```
-    Outputs a ranked list of books tailored to your tastes.
+    Outputs a ranked list of books for you to choose from.
