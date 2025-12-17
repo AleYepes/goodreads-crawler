@@ -4,13 +4,14 @@ import json
 import os
 import re
 import glob
-import math
 import heapq
 import html
 import csv
+import pandas as pd
+import numpy as np
+import traceback
 from bs4 import BeautifulSoup
 from pathlib import Path
-import pandas as pd
 from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 from playwright.async_api import async_playwright
@@ -58,7 +59,7 @@ def download_library(email, password):
 
 
 def parse_similar_books_string(encoded_str):
-    if not isinstance(encoded_str, str):
+    if not isinstance(encoded_str, str) or not encoded_str:
         return []
     
     similar_books = []
@@ -69,34 +70,30 @@ def parse_similar_books_string(encoded_str):
 
 
 def prep_crawl_heapq(library_df):
-    scraped_book_ids = set()
-    queued_book_ids = set()
-    id_scraping_queue = []
-    seed_book_ids = library_df['book_id'].dropna().astype(int).tolist()
+    crawl_queue = {int(book_id): 5.0 for book_id in library_df['book_id'].dropna()} # Max score of 5 to prioritize library seed ids
+    scraped_ids = set()
 
-    # Load existing progress
-    try:
-        if OUTPUT_PATH.exists():
-            df_iter = pd.read_csv(OUTPUT_PATH, usecols=['book_id', 'similar_books'], chunksize=5000, on_bad_lines='skip')
-            for chunk in df_iter:
-                scraped_book_ids.update(chunk['book_id'].dropna().astype(int).tolist())
+    if OUTPUT_PATH.exists():
+        scraped_df = pd.read_csv(OUTPUT_PATH, usecols=['book_id', 'similar_books'], on_bad_lines='skip')
+        scraped_ids.update(scraped_df['book_id'].dropna().astype(int))
+
+        for similar_books_str in scraped_df['similar_books'].dropna():
+            for book in similar_books_str.split('|'):
+                book_id_str, rating_str = book.split(':')
+                book_id = int(book_id_str)
+                rating = float(rating_str)
                 
-                for similar_books_string in chunk['similar_books'].dropna():
-                    similar_books = parse_similar_books_string(similar_books_string)
-                    for book_id, count_adj_rating in similar_books:
-                        if book_id not in scraped_book_ids and book_id not in id_scraping_queue:
-                            heapq.heappush(id_scraping_queue, (-count_adj_rating, book_id))
-                            queued_book_ids.add(book_id)
-    except Exception as e:
-        print(f"Error reading CSV, potentially severe corruption: {e}")
+                if book_id not in scraped_ids:
+                    if rating >= crawl_queue.get(book_id, 0):
+                        crawl_queue[book_id] = rating
 
-    # Find remaining books from library export
-    for book_id in seed_book_ids:
-        if book_id not in scraped_book_ids and book_id not in id_scraping_queue:
-            heapq.heappush(id_scraping_queue, (-5.0, book_id)) # -5 max theoretical count_adj_rating to prioritize seed ids before others on the queue
-            queued_book_ids.add(book_id)
+        for book_id in scraped_ids:
+            crawl_queue.pop(book_id, None)
 
-    return id_scraping_queue, scraped_book_ids, queued_book_ids
+    crawl_queue = [(-rating, book_id) for book_id, rating in crawl_queue.items()]
+    heapq.heapify(crawl_queue)
+
+    return crawl_queue, scraped_ids, set(crawl_queue.keys())
 
 
 async def fetch_book(page, book_id):
@@ -207,7 +204,7 @@ async def fetch_book(page, book_id):
                 avg_rating = float(stats.get("averageRating"))
                 rating_count = int(stats.get("ratingsCount"))
 
-                count_adj_rating = avg_rating - (avg_rating - 3) / math.sqrt(rating_count + 1)
+                count_adj_rating = avg_rating - (avg_rating - 3) / np.log1p(rating_count)#math.sqrt(rating_count + 1)
                 similar_books.append(f"{similar_book_id}:{round(count_adj_rating,2)}")
 
         book_data["similar_books"] = "|".join(similar_books)
@@ -243,7 +240,7 @@ async def fetch_book(page, book_id):
             pass
 
 
-async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
+async def run_crawler(crawl_queue, scraped_book_ids, queued_book_ids):
 
     async def block_media(route):
         if route.request.resource_type in ["image", "media", "font"]:
@@ -281,12 +278,12 @@ async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
                 page_pool.put_nowait(pg)
 
             active_tasks = set()
-            pbar = tqdm(total=len(scraped_book_ids) + len(id_scraping_queue), initial=len(scraped_book_ids))
+            pbar = tqdm(total=len(scraped_book_ids) + len(crawl_queue), initial=len(scraped_book_ids))
 
             try:
-                while id_scraping_queue or active_tasks:
-                    while id_scraping_queue and not page_pool.empty():
-                        _, current_id = heapq.heappop(id_scraping_queue)
+                while crawl_queue or active_tasks:
+                    while crawl_queue and not page_pool.empty():
+                        _, current_id = heapq.heappop(crawl_queue)
                         if current_id in scraped_book_ids:
                             continue
 
@@ -299,21 +296,25 @@ async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
 
                     done, active_tasks = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
                     for task in done:
-                        book_data = task.result()
-                        if book_data:
-                            writer.writerow(book_data)
-                            f.flush()
-                            scraped_book_ids.add(book_data['book_id'])
-                            pbar.update(1)
-                        
-                            similar_books = parse_similar_books_string(book_data.get('similar_books'))
-                            added_count = 0
-                            for similar_book_id, count_adj_rating in similar_books:
-                                if similar_book_id not in scraped_book_ids and similar_book_id not in queued_book_ids:
-                                    heapq.heappush(id_scraping_queue, (-count_adj_rating, similar_book_id))
-                                    queued_book_ids.add(similar_book_id)
-                                    added_count += 1
-                            pbar.total += added_count
+                        try:
+                            book_data = task.result()
+                            if book_data:
+                                writer.writerow(book_data)
+                                f.flush()
+                                scraped_book_ids.add(book_data['book_id'])
+                                pbar.update(1)
+                            
+                                similar_books = parse_similar_books_string(book_data.get('similar_books'))
+                                added_count = 0
+                                for similar_book_id, count_adj_rating in similar_books:
+                                    if similar_book_id not in scraped_book_ids and similar_book_id not in queued_book_ids:
+                                        heapq.heappush(crawl_queue, (-count_adj_rating, similar_book_id))
+                                        queued_book_ids.add(similar_book_id)
+                                        added_count += 1
+                                pbar.total += added_count
+                        except Exception as e:
+                            tqdm.write(f"\nCaught unexpected error processing book task: {e}")
+                            traceback.print_exc()
             finally:
                 pbar.close()
                 for task in active_tasks:
@@ -339,6 +340,7 @@ def main():
     parser.add_argument("--fd", action="store_true")
     args = parser.parse_args()
 
+    print('prep library')
     if args.fd or not glob.glob(str(LIBRARY_PATH)):
         email = os.getenv("GOODREADS_EMAIL")
         password = os.getenv("GOODREADS_PASSWORD")
@@ -346,9 +348,11 @@ def main():
     else:
         library_df = pd.read_csv(LIBRARY_PATH)
 
-    id_scraping_queue, scraped_book_ids, queued_book_ids = prep_crawl_heapq(library_df)
+    print('prep crawl heap')
+    crawl_queue, scraped_book_ids, queued_book_ids = prep_crawl_heapq(library_df)
     try:
-        asyncio.run(run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids))
+        print('start crawl')
+        asyncio.run(run_crawler(crawl_queue, scraped_book_ids, queued_book_ids))
     except KeyboardInterrupt:
         print("\nShutdown requested. Progress saved to CSV.")
 
