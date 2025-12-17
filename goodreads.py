@@ -7,7 +7,7 @@ import glob
 import heapq
 import html
 import csv
-import math
+import random
 import pandas as pd
 import numpy as np
 import traceback
@@ -222,7 +222,7 @@ async def fetch_book(page, book_id):
         if await modal_close_btn.is_visible():
             await modal_close_btn.click()
 
-        await page.evaluate(f"window.scrollBy(0, {math.randint(100,200)})")
+        await page.evaluate(f"window.scrollBy(0, {random.randint(100,200)})")
 
         book_data = await extract_linked_data_basics(page, book_id)
         book_data = await extract_dom_data(page, book_data)
@@ -270,61 +270,67 @@ async def run_crawler(crawl_queue, scraped_book_ids, queued_book_ids):
         if not file_exists:
             writer.writeheader()
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False) # Seems that running headed is required for GraphQL triggers to fire
-            context = await browser.new_context(user_agent=USER_AGENT)
-            await context.route("**/*", block_media)
+        pbar = tqdm(total=len(scraped_book_ids) + len(crawl_queue), initial=len(scraped_book_ids), unit='book')
 
-            page_pool = asyncio.Queue()
-            for _ in range(CONCURRENCY):
-                pg = await context.new_page()
-                page_pool.put_nowait(pg)
+        try:
+            while crawl_queue:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=False) # Seems that running headed is required for GraphQL triggers to fire
+                    context = await browser.new_context(user_agent=USER_AGENT)
+                    await context.route("**/*", block_media)
 
-            active_tasks = set()
-            pbar = tqdm(total=len(scraped_book_ids) + len(crawl_queue), initial=len(scraped_book_ids), unit='book')
+                    page_pool = asyncio.Queue()
+                    for _ in range(CONCURRENCY):
+                        pg = await context.new_page()
+                        page_pool.put_nowait(pg)
 
-            try:
-                while crawl_queue or active_tasks:
-                    while crawl_queue and not page_pool.empty():
-                        _, current_id = heapq.heappop(crawl_queue)
-                        if current_id in scraped_book_ids:
-                            continue
+                    active_tasks = set()
+                    window_processed_count = 0
+                    while crawl_queue or active_tasks:
+                        while (crawl_queue and not page_pool.empty() and window_processed_count < RESTART_THRESHOLD):
+                            _, current_id = heapq.heappop(crawl_queue)
+                            if current_id in scraped_book_ids:
+                                continue
 
-                        page = page_pool.get_nowait()
-                        
-                        task = asyncio.create_task(fetch_book_wrapper(page, current_id, page_pool))
-                        active_tasks.add(task)
-                    if not active_tasks:
-                        break
+                            page = page_pool.get_nowait()
+                            task = asyncio.create_task(fetch_book_wrapper(page, current_id, page_pool))
+                            active_tasks.add(task)
+                        if not active_tasks:
+                            break
 
-                    done, active_tasks = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        try:
-                            book_data = task.result()
-                            if book_data:
-                                writer.writerow(book_data)
-                                f.flush()
-                                scraped_book_ids.add(book_data['book_id'])
-                                pbar.update(1)
+                        done, active_tasks = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            try:
+                                window_processed_count += 1
+                                book_data = task.result()
+                                if book_data:
+                                    writer.writerow(book_data)
+                                    f.flush()
+                                    scraped_book_ids.add(book_data['book_id'])
+                                    pbar.update(1)
+                                
+                                    similar_books = parse_similar_books_string(book_data.get('similar_books'))
+                                    added_count = 0
+                                    for similar_book_id, count_adj_rating in similar_books:
+                                        if similar_book_id not in scraped_book_ids and similar_book_id not in queued_book_ids:
+                                            heapq.heappush(crawl_queue, (-count_adj_rating, similar_book_id))
+                                            queued_book_ids.add(similar_book_id)
+                                            added_count += 1
+                                    pbar.total += added_count
+                            except Exception as e:
+                                tqdm.write(f"\nError post-processing task: {e}")
+                                traceback.print_exc()
                             
-                                similar_books = parse_similar_books_string(book_data.get('similar_books'))
-                                added_count = 0
-                                for similar_book_id, count_adj_rating in similar_books:
-                                    if similar_book_id not in scraped_book_ids and similar_book_id not in queued_book_ids:
-                                        heapq.heappush(crawl_queue, (-count_adj_rating, similar_book_id))
-                                        queued_book_ids.add(similar_book_id)
-                                        added_count += 1
-                                pbar.total += added_count
-                        except Exception as e:
-                            tqdm.write(f"\nCaught unexpected error processing book task: {e}")
-                            traceback.print_exc()
-            finally:
-                pbar.close()
-                for task in active_tasks:
-                    task.cancel()
-                if active_tasks:
-                    await asyncio.gather(*active_tasks, return_exceptions=True)
-                await browser.close()
+                    if window_processed_count >= RESTART_THRESHOLD:
+                        await asyncio.sleep(1)
+
+        finally:
+            pbar.close()
+            for task in active_tasks:
+                task.cancel()
+            if active_tasks:
+                await asyncio.gather(*active_tasks, return_exceptions=True)
+            await browser.close()
 
 
 DATA_DIR = Path("data")
@@ -337,6 +343,7 @@ CONCURRENCY = 3
 PAYLOAD_WAIT_ATTEMPTS = 20
 PAGE_TIMEOUT_MS = 10000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+RESTART_THRESHOLD = 100
 
 def main():
     parser = argparse.ArgumentParser()
