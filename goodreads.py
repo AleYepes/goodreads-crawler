@@ -100,12 +100,17 @@ def prep_crawl_heapq(library_df):
 
 
 async def fetch_book(page, book_id):
-    captured_payloads = []
 
     async def handle_response(response):
+        if not collecting:
+            return
+        
         if "graphql" in response.url and response.request.method == "POST":
-            json_body = await response.json()
-            captured_payloads.append(json_body)
+            try:
+                json_body = await response.json()
+                captured_payloads.append(json_body)
+            except Exception:
+                pass
 
     async def extract_linked_data_basics(page, book_id):
         script_locator = page.locator('script[type="application/ld+json"]').first
@@ -179,11 +184,12 @@ async def fetch_book(page, book_id):
 
         return book_data
 
-    async def extract_similar_books_json(page, book_data, captured_payloads):
+    async def extract_similar_books_json(page, book_data, captured_payloads, collecting):
         wait_attempts = 0
         while not any("getSimilarBooks" in str(p) for p in captured_payloads) and wait_attempts < PAYLOAD_WAIT_ATTEMPTS:
             await page.wait_for_timeout(500)
             wait_attempts += 1
+        collecting = False
         
         similar_books = []
         for payload in captured_payloads:
@@ -200,12 +206,15 @@ async def fetch_book(page, book_id):
                 stats = book_node.get("work").get("stats", {})
                 avg_rating = float(stats.get("averageRating"))
                 rating_count = int(stats.get("ratingsCount"))
+
                 count_adj_rating = avg_rating - (avg_rating - 3) / math.sqrt(rating_count + 1)
                 similar_books.append(f"{similar_book_id}:{round(count_adj_rating,2)}")
 
         book_data["similar_books"] = "|".join(similar_books)
         return book_data
 
+    captured_payloads = []
+    collecting = True
     page.on("response", handle_response)
     try:
         url = f"https://www.goodreads.com/book/show/{book_id}"
@@ -217,16 +226,21 @@ async def fetch_book(page, book_id):
 
         book_data = await extract_linked_data_basics(page, book_id)
         book_data = await extract_dom_data(page, book_data)
-        book_data = await extract_similar_books_json(page, book_data, captured_payloads)
+        book_data = await extract_similar_books_json(page, book_data, captured_payloads, collecting)
 
         return book_data
 
     except Exception as e:
-        tqdm.write(f"Task Failed: {e}")
+        if "Target closed" not in str(e):
+             tqdm.write(f"Task Failed for {book_id}: {e}")
         return None
     finally:
+        collecting = False
         page.remove_listener("response", handle_response)
-        await page.goto("about:blank")
+        try:
+            await page.goto("about:blank")
+        except Exception:
+            pass
 
 
 async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
@@ -268,39 +282,45 @@ async def run_crawler(id_scraping_queue, scraped_book_ids, queued_book_ids):
 
             active_tasks = set()
             pbar = tqdm(total=len(scraped_book_ids) + len(id_scraping_queue), initial=len(scraped_book_ids))
-            while id_scraping_queue or active_tasks:
-                while id_scraping_queue and not page_pool.empty():
-                    _, current_id = heapq.heappop(id_scraping_queue)
-                    if current_id in scraped_book_ids:
-                        continue
 
-                    page = page_pool.get_nowait()
-                    
-                    task = asyncio.create_task(fetch_book_wrapper(page, current_id, page_pool))
-                    active_tasks.add(task)
-                if not active_tasks:
-                    break
+            try:
+                while id_scraping_queue or active_tasks:
+                    while id_scraping_queue and not page_pool.empty():
+                        _, current_id = heapq.heappop(id_scraping_queue)
+                        if current_id in scraped_book_ids:
+                            continue
 
-                done, active_tasks = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    book_data = task.result()
-                    if book_data:
-                        writer.writerow(book_data)
-                        f.flush()
-                        scraped_book_ids.add(book_data['book_id'])
-                        pbar.update(1)
-                    
-                        similar_books = parse_similar_books_string(book_data.get('similar_books'))
-                        added_count = 0
-                        for similar_book_id, count_adj_rating in similar_books:
-                            if similar_book_id not in scraped_book_ids and similar_book_id not in queued_book_ids:
-                                heapq.heappush(id_scraping_queue, (-count_adj_rating, similar_book_id))
-                                queued_book_ids.add(similar_book_id)
-                                added_count += 1
-                        pbar.total += added_count
+                        page = page_pool.get_nowait()
+                        
+                        task = asyncio.create_task(fetch_book_wrapper(page, current_id, page_pool))
+                        active_tasks.add(task)
+                    if not active_tasks:
+                        break
 
-            pbar.close()
-            await browser.close()
+                    done, active_tasks = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        book_data = task.result()
+                        if book_data:
+                            writer.writerow(book_data)
+                            f.flush()
+                            scraped_book_ids.add(book_data['book_id'])
+                            pbar.update(1)
+                        
+                            similar_books = parse_similar_books_string(book_data.get('similar_books'))
+                            added_count = 0
+                            for similar_book_id, count_adj_rating in similar_books:
+                                if similar_book_id not in scraped_book_ids and similar_book_id not in queued_book_ids:
+                                    heapq.heappush(id_scraping_queue, (-count_adj_rating, similar_book_id))
+                                    queued_book_ids.add(similar_book_id)
+                                    added_count += 1
+                            pbar.total += added_count
+            finally:
+                pbar.close()
+                for task in active_tasks:
+                    task.cancel()
+                if active_tasks:
+                    await asyncio.gather(*active_tasks, return_exceptions=True)
+                await browser.close()
 
 
 DATA_DIR = Path("data")
@@ -309,7 +329,7 @@ LIBRARY_PATH = DATA_DIR / "goodreads_library_export.csv"
 OUTPUT_PATH = DATA_DIR / "books.csv"
 
 load_dotenv()
-CONCURRENCY = 2
+CONCURRENCY = 3
 PAYLOAD_WAIT_ATTEMPTS = 20
 PAGE_TIMEOUT_MS = 30000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
