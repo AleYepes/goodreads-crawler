@@ -70,6 +70,32 @@ def parse_similar_books_string(encoded_str):
     return similar_books
 
 
+def parse_and_score_similar_books(encoded_str):
+    if not isinstance(encoded_str, str) or not encoded_str:
+        return []
+    
+    similar_books = []
+    for item in encoded_str.split("|"):
+        try:
+            parts = item.split(":")
+            if len(parts) == 3:
+                book_id = int(parts[0])
+                avg = float(parts[1])
+                count = int(parts[2])
+                score = calculate_score(avg, count)
+                similar_books.append((book_id, score))
+        except ValueError:
+            continue
+            
+    return similar_books
+
+
+def calculate_score(avg_rating, rating_count):
+    # return avg_rating - (avg_rating - 3) / np.sqrt(rating_count + 1)
+    # return avg_rating - (avg_rating - 3) / np.log(rating_count + 10)
+    return avg_rating - avg_rating / np.log(rating_count + 10)
+
+
 def prep_crawl_heapq(library_df):
     crawl_queue = {int(book_id): 5.0 for book_id in library_df['book_id'].dropna()} # Max score of 5 to prioritize library seed ids
     scraped_ids = set()
@@ -79,14 +105,11 @@ def prep_crawl_heapq(library_df):
         scraped_ids.update(scraped_df['book_id'].dropna().astype(int))
 
         for similar_books_str in scraped_df['similar_books'].dropna():
-            for book in similar_books_str.split('|'):
-                book_id_str, rating_str = book.split(':')
-                book_id = int(book_id_str)
-                rating = float(rating_str)
-                
+            scored_neighbors = parse_and_score_similar_books(similar_books_str)
+            for book_id, score in scored_neighbors:
                 if book_id not in scraped_ids:
-                    if rating >= crawl_queue.get(book_id, 0):
-                        crawl_queue[book_id] = rating
+                    if score >= crawl_queue.get(book_id, 0):
+                        crawl_queue[book_id] = score
 
         for book_id in scraped_ids:
             crawl_queue.pop(book_id, None)
@@ -205,10 +228,7 @@ async def fetch_book(page, book_id):
                 avg_rating = float(stats.get("averageRating"))
                 rating_count = int(stats.get("ratingsCount"))
 
-                # count_adj_rating = avg_rating - (avg_rating - 3) / np.sqrt(rating_count + 1)
-                # count_adj_rating = avg_rating - (avg_rating - 3) / np.log(rating_count + 10)
-                count_adj_rating = avg_rating - avg_rating / np.log(rating_count + 10)
-                similar_books.append(f"{similar_book_id}:{round(count_adj_rating,2)}")
+                similar_books.append(f"{similar_book_id}:{avg_rating}:{rating_count}")
 
         book_data["similar_books"] = "|".join(similar_books)
         return book_data
@@ -311,11 +331,11 @@ async def run_crawler(crawl_queue, scraped_book_ids, queued_book_ids):
                                     scraped_book_ids.add(book_data['book_id'])
                                     pbar.update(1)
                                 
-                                    similar_books = parse_similar_books_string(book_data.get('similar_books'))
+                                    scored_neighbors = parse_and_score_similar_books(book_data.get('similar_books'))
                                     added_count = 0
-                                    for similar_book_id, count_adj_rating in similar_books:
+                                    for similar_book_id, score in scored_neighbors:
                                         if similar_book_id not in scraped_book_ids and similar_book_id not in queued_book_ids:
-                                            heapq.heappush(crawl_queue, (-count_adj_rating, similar_book_id))
+                                            heapq.heappush(crawl_queue, (-score, similar_book_id))
                                             queued_book_ids.add(similar_book_id)
                                             added_count += 1
                                     pbar.total += added_count
