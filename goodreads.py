@@ -93,7 +93,7 @@ def prep_crawl_heapq(library_df):
     crawl_queue = [(-rating, book_id) for book_id, rating in crawl_queue.items()]
     heapq.heapify(crawl_queue)
 
-    return crawl_queue, scraped_ids, set(crawl_queue.keys())
+    return crawl_queue, scraped_ids, {book_id for _, book_id in crawl_queue}
 
 
 async def fetch_book(page, book_id):
@@ -221,6 +221,8 @@ async def fetch_book(page, book_id):
         if await modal_close_btn.is_visible():
             await modal_close_btn.click()
 
+        await page.evaluate("window.scrollBy(0, 100)")
+
         book_data = await extract_linked_data_basics(page, book_id)
         book_data = await extract_dom_data(page, book_data)
         book_data = await extract_similar_books_json(page, book_data, captured_payloads, collecting)
@@ -278,7 +280,7 @@ async def run_crawler(crawl_queue, scraped_book_ids, queued_book_ids):
                 page_pool.put_nowait(pg)
 
             active_tasks = set()
-            pbar = tqdm(total=len(scraped_book_ids) + len(crawl_queue), initial=len(scraped_book_ids))
+            pbar = tqdm(total=len(scraped_book_ids) + len(crawl_queue), initial=len(scraped_book_ids), unit='book')
 
             try:
                 while crawl_queue or active_tasks:
@@ -340,7 +342,6 @@ def main():
     parser.add_argument("--fd", action="store_true")
     args = parser.parse_args()
 
-    print('prep library')
     if args.fd or not glob.glob(str(LIBRARY_PATH)):
         email = os.getenv("GOODREADS_EMAIL")
         password = os.getenv("GOODREADS_PASSWORD")
@@ -348,14 +349,11 @@ def main():
     else:
         library_df = pd.read_csv(LIBRARY_PATH)
 
-    print('prep crawl heap')
     crawl_queue, scraped_book_ids, queued_book_ids = prep_crawl_heapq(library_df)
     try:
-        print('start crawl')
         asyncio.run(run_crawler(crawl_queue, scraped_book_ids, queued_book_ids))
     except KeyboardInterrupt:
-        print("\nShutdown requested. Progress saved to CSV.")
-
+        pass
 
 if __name__ == "__main__":
     main()
