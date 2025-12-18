@@ -41,17 +41,24 @@ def download_library(email, password):
         # Prep export
         page.wait_for_selector(".homePrimaryColumn", timeout=60000)
         page.goto("https://www.goodreads.com/review/import", wait_until="domcontentloaded")
-        page.locator(".js-LibraryExport").first.click()
+
+        export_button = page.locator(".js-LibraryExport").first
+        while True:
+            if export_button.is_visible():
+                export_button.click()
+                break
+            page.wait_for_timeout(500)
         
         prepped_export_list = page.locator(".fileList")
-        for _ in range(120):
+        for _ in range(240):
             if prepped_export_list.count() > 0 and prepped_export_list.locator("a").count() > 0:
                 break
             page.wait_for_timeout(500)
         
         # Export library
         with page.expect_download() as download_info:
-            prepped_export_list.locator("a").first.click()
+            list = prepped_export_list.locator("a").first
+            list.click()
         download_info.value.save_as(LIBRARY_PATH)
         browser.close()
 
@@ -308,7 +315,7 @@ async def run_crawler(library_df):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fd", action="store_true")
+    parser.add_argument("-fd", action="store_true")
     args = parser.parse_args()
 
     if args.fd or not glob.glob(str(LIBRARY_PATH)):
@@ -337,12 +344,11 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 RESTART_THRESHOLD = 200
 
 SCORING_FUNCTIONS = [
-    lambda avg_rating, rating_count: avg_rating - (avg_rating - 3) / np.sqrt(rating_count + 1),
-    lambda avg_rating, rating_count: avg_rating - (avg_rating - 3) / np.log(rating_count + 10),
     lambda avg_rating, rating_count: avg_rating - avg_rating / np.sqrt(rating_count + 1),
+    lambda avg_rating, rating_count: rating_count,
     lambda avg_rating, rating_count: avg_rating - avg_rating / np.log(rating_count + 10),
+    lambda avg_rating, rating_count: rating_count,
 ]
-
 
 if __name__ == "__main__":
     main()
