@@ -52,3 +52,10 @@ Async crawler and recommender system to find good books to read.
     python3 recommend.py
     ```
     Outputs a ranked list of books for you to choose from.
+
+## Jupyter-Git stuff
+```
+pip install nbstripout nbdime
+nbstripout --install
+nbdime config-git --enable
+```
