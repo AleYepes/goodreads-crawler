@@ -1,0 +1,12 @@
+torch-geometric
+umap-learn
+playwright
+ollama
+python-dotenv
+beautifulsoup4
+tqdm
+networkx
+scikit-learn
+pandas
+numpy
+torch
