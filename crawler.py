@@ -81,7 +81,7 @@ def parse_and_score_similar_books(encoded_str, scoring_func):
 
 
 def prep_crawl_heapq(library_df, scoring_func):
-    crawl_queue = {int(book_id): 5.0 for book_id in library_df['book_id'].dropna()} # Max score of 5 to prioritize library seed ids
+    crawl_queue = {int(book_id): 9e7 for book_id in library_df['book_id'].dropna()} # Prioritize library seed ids
     scraped_ids = set()
 
     if OUTPUT_PATH.exists():
