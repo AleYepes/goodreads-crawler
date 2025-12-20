@@ -143,6 +143,15 @@ async def fetch_book(page, book_id):
             book_data[f"{i}_star"] = int(text) if text.isdigit() else 0
 
         # Genres
+        try:
+            if await page.query_selector('button[aria-label="Show all items in the list"]'):
+                await page.click('button[aria-label="Show all items in the list"]')
+                await page.wait_for_timeout(100) 
+                html_content = await page.content()
+                soup = BeautifulSoup(html_content, "html.parser")
+        except Exception:
+            pass
+
         genre_nodes = soup.select(".BookPageMetadataSection__genreButton .Button__labelItem")
         genres = [node.get_text() for node in genre_nodes if node.get_text() != "...more"]
         book_data['genres'] = "|".join(genres)
@@ -164,6 +173,50 @@ async def fetch_book(page, book_id):
             book_data['description'] = re.sub(r'\n{3,}', '\n\n', desc_el.get_text()).strip()
         else:
             book_data['description'] = ""
+
+        # Currently reading 
+        reading_el = soup.find(attrs={"data-testid": "currentlyReadingSignal"})
+        if reading_el:
+            text = reading_el.get_text()
+            match = re.search(r'(\d+)', text.replace(",", ""))
+            book_data['currently_reading'] = int(match.group(1)) if match else 0
+        else:
+            book_data['currently_reading'] = 0
+
+        # Want to read
+        wtr_el = soup.find(attrs={"data-testid": "toReadSignal"})
+        if wtr_el:
+            text = wtr_el.get_text()
+            match = re.search(r'(\d+)', text.replace(",", ""))
+            book_data['want_to_read'] = int(match.group(1)) if match else 0
+        else:
+            book_data['want_to_read'] = 0
+
+        # Author name
+        author_name_el = soup.find(attrs={"data-testid": "name"})
+        book_data['primary_author'] = author_name_el.get_text().strip() if author_name_el else ""
+
+        # Author stats
+        author_stats_el = soup.select_one(".FeaturedPerson__infoPrimary .Text__subdued")
+        
+        book_data['author_num_books'] = 0
+        book_data['author_followers'] = 0
+        if author_stats_el:
+            stats_text = author_stats_el.get_text(separator=" ", strip=True)
+            
+            books_match = re.search(r'([\d,]+)\s*books', stats_text)
+            if books_match:
+                book_data['author_num_books'] = int(books_match.group(1).replace(",", ""))
+
+            # Author follower count
+            followers_match = re.search(r'([\d,kKmM\.]+)\s*followers', stats_text)
+            if followers_match:
+                val = followers_match.group(1).lower().replace(",", "")
+                if 'k' in val:
+                    val = float(val.replace('k', '')) * 1e3
+                elif 'm' in val:
+                    val = float(val.replace('m', '')) * 1e6
+                book_data['author_followers'] = int(val)
 
         return book_data
 
