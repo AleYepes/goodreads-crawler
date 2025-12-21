@@ -92,7 +92,6 @@ def filter_save_file():
                 book_df[col] = pd.to_numeric(book_df[col], errors='coerce').astype('Int64')
             book_df['year'] = pd.to_numeric(book_df['year'], errors='coerce').astype('Int16')
 
-            # book_df.dropna(subset=['book_id']) 
             book_df = book_df[~book_df['similar_books'].isna()]
 
             temp_path = OUTPUT_PATH.with_suffix('.tmp')
@@ -322,8 +321,11 @@ async def run_crawler(library_df):
     ]
 
     cycle = 0
+    scoring_algo_names = list(SCORING_FUNCTIONS.keys())
     while True:
-        scoring_func = SCORING_FUNCTIONS[cycle % len(SCORING_FUNCTIONS)]
+        current_algo_name = scoring_algo_names[cycle % len(scoring_algo_names)]
+        scoring_func = SCORING_FUNCTIONS[current_algo_name]
+
         filter_save_file()
         crawl_queue, scraped_ids, queued_ids = prep_crawl_heapq(library_df, scoring_func)
 
@@ -336,10 +338,15 @@ async def run_crawler(library_df):
             if not file_exists:
                 writer.writeheader()
 
-            pbar = tqdm(total=len(scraped_ids) + len(crawl_queue), initial=len(scraped_ids), unit='book')
+            pbar = tqdm(
+                total=len(scraped_ids) + len(crawl_queue), 
+                initial=len(scraped_ids), 
+                unit='book',
+                desc=f"{current_algo_name}" 
+            )
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=False) # Seems that running headed is required for GraphQL triggers to fire
+                browser = await p.chromium.launch(headless=False) # Running headed is required for GraphQL triggers to fire
                 context = await browser.new_context(user_agent=USER_AGENT)
                 await context.route("**/*", block_media)
 
@@ -427,12 +434,10 @@ PAGE_TIMEOUT_MS = 20000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 RESTART_THRESHOLD = 200
 
-SCORING_FUNCTIONS = [
-    # lambda avg_rating, rating_count: avg_rating - avg_rating / np.sqrt(rating_count + 1),
-    # lambda avg_rating, rating_count: rating_count,
-    lambda avg_rating, rating_count: avg_rating - avg_rating / np.log10(rating_count + 10),
-    lambda avg_rating, rating_count: rating_count,
-]
+SCORING_FUNCTIONS = {
+    "Rating": lambda avg_rating, rating_count: avg_rating - avg_rating / np.log10(rating_count + 10),
+    "Count": lambda avg_rating, rating_count: rating_count,
+}
 
 if __name__ == "__main__":
     main()
