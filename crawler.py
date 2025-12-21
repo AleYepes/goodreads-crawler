@@ -41,6 +41,7 @@ def download_library(email, password):
         # Prep export
         page.wait_for_selector(".homePrimaryColumn", timeout=60000)
         page.goto("https://www.goodreads.com/review/import", wait_until="domcontentloaded")
+        page.wait_for_selector(".js-LibraryExport", timeout=10000)
 
         export_button = page.locator(".js-LibraryExport").first
         while True:
@@ -78,6 +79,28 @@ def parse_and_score_similar_books(encoded_str, scoring_func):
         except ValueError:
             continue
     return similar_books
+
+
+def filter_save_file():
+    if OUTPUT_PATH.exists():
+        try:
+            book_df = pd.read_csv(OUTPUT_PATH, on_bad_lines='skip')
+            star_cols = [col for col in book_df.columns if col.endswith('star')]
+            int_cols = ['book_id', 'review_count', 'num_pages', 'author_followers', 
+                        'want_to_read', 'author_num_books', 'currently_reading'] + star_cols
+            for col in int_cols:
+                book_df[col] = pd.to_numeric(book_df[col], errors='coerce').astype('Int64')
+            book_df['year'] = pd.to_numeric(book_df['year'], errors='coerce').astype('Int16')
+
+            # book_df.dropna(subset=['book_id']) 
+            book_df = book_df[~book_df['similar_books'].isna()]
+
+            temp_path = OUTPUT_PATH.with_suffix('.tmp')
+            book_df.to_csv(temp_path, index=False)
+            temp_path.replace(OUTPUT_PATH)
+        except Exception as e:
+            print(f"Error cleaning file: {e}")
+            traceback.print_exc()
 
 
 def prep_crawl_heapq(library_df, scoring_func):
@@ -238,19 +261,24 @@ async def fetch_book(page, book_id):
 
         book_data["similar_books"] = "|".join(similar_books)
         return book_data
+    
+    async def close_modal(page):
+        try:
+            close_btn = page.locator(".Overlay__close button, [aria-label='Close']").first
+            if await close_btn.is_visible():
+                await close_btn.click(timeout=2000)
+        except Exception:
+            pass
 
+    await close_modal(page)
     captured_payloads = []
     collecting = True
     page.on("response", handle_response)
     try:
         url = f"https://www.goodreads.com/book/show/{book_id}"
         await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-
-        modal_close_btn = page.locator(".Overlay__close button").first
-        if await modal_close_btn.is_visible():
-            await modal_close_btn.click()
-
         await page.evaluate(f"window.scrollBy(0, {random.randint(100,200)})")
+        await close_modal(page)
 
         book_data = await extract_linked_data_basics(page, book_id)
         book_data = await extract_dom_data(page, book_data)
@@ -288,12 +316,15 @@ async def run_crawler(library_df):
     field_names = [
         "book_id", "title", "authors", "avg_rating", "review_count", 
         "num_pages", "lang", "1_star", "2_star", "3_star", "4_star", 
-        "5_star", "genres", "series", "year", "description", "similar_books"
+        "5_star", "genres", "series", "year", "description", "similar_books",
+        "primary_author", "author_followers", "want_to_read", 
+        "author_num_books", "currently_reading"
     ]
 
     cycle = 0
     while True:
         scoring_func = SCORING_FUNCTIONS[cycle % len(SCORING_FUNCTIONS)]
+        filter_save_file()
         crawl_queue, scraped_ids, queued_ids = prep_crawl_heapq(library_df, scoring_func)
 
         if not crawl_queue:
@@ -392,14 +423,14 @@ OUTPUT_PATH = DATA_DIR / "books.csv"
 load_dotenv()
 CONCURRENCY = 3
 PAYLOAD_WAIT_ATTEMPTS = 20
-PAGE_TIMEOUT_MS = 10000
+PAGE_TIMEOUT_MS = 20000
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 RESTART_THRESHOLD = 200
 
 SCORING_FUNCTIONS = [
-    lambda avg_rating, rating_count: avg_rating - avg_rating / np.sqrt(rating_count + 1),
-    lambda avg_rating, rating_count: rating_count,
-    lambda avg_rating, rating_count: avg_rating - avg_rating / np.log(rating_count + 10),
+    # lambda avg_rating, rating_count: avg_rating - avg_rating / np.sqrt(rating_count + 1),
+    # lambda avg_rating, rating_count: rating_count,
+    lambda avg_rating, rating_count: avg_rating - avg_rating / np.log10(rating_count + 10),
     lambda avg_rating, rating_count: rating_count,
 ]
 
