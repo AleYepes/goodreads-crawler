@@ -326,7 +326,7 @@ async def run_crawler(library_df):
         current_algo_name = scoring_algo_names[cycle % len(scoring_algo_names)]
         scoring_func = SCORING_FUNCTIONS[current_algo_name]
 
-        filter_save_file()
+        # filter_save_file()
         crawl_queue, scraped_ids, queued_ids = prep_crawl_heapq(library_df, scoring_func)
 
         if not crawl_queue:
