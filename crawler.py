@@ -25,7 +25,7 @@ RATING_MAP = {"it was amazing": 5, "really liked it": 4, "liked it": 3, "it was 
 def clean_text(text):
     return text.strip().replace("\n", "") if text else ""
 
-def download_library(email, password):
+async def download_library(email, password):
 
     def preprocess_library():
         df = pd.read_csv(MY_LIBRARY_PATH)
@@ -33,47 +33,50 @@ def download_library(email, password):
         df.to_csv(MY_LIBRARY_PATH, index=False)
         return df
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(viewport={"width": 1280, "height": 800}, user_agent=USER_AGENT, accept_downloads=True)
-        page = context.new_page()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context(viewport={"width": 1280, "height": 800}, user_agent=USER_AGENT, accept_downloads=True)
+        page = await context.new_page()
         
         # Log in
-        page.goto("https://www.goodreads.com/ap/signin?language=en_US&openid.assoc_handle=amzn_goodreads_web_na&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.mode=checkid_setup&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.goodreads.com%2Fap-handler%2Fsign-in")
-        page.fill('input[type="email"]', email)
-        page.fill('input[type="password"]', password)
-        page.click('input[type="submit"]')
+        await page.goto("https://www.goodreads.com/ap/signin?language=en_US&openid.assoc_handle=amzn_goodreads_web_na&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.mode=checkid_setup&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.goodreads.com%2Fap-handler%2Fsign-in")
+        await page.fill('input[type="email"]', email)
+        await page.fill('input[type="password"]', password)
+        await page.click('input[type="submit"]')
 
         # Prep export
-        page.wait_for_selector(".homePrimaryColumn", timeout=60000)
-        page.goto("https://www.goodreads.com/review/import", wait_until="domcontentloaded")
-        page.wait_for_selector(".js-LibraryExport", timeout=10000)
+        await page.wait_for_selector(".homePrimaryColumn", timeout=60000)
+        await page.goto("https://www.goodreads.com/review/import", wait_until="domcontentloaded")
+        await page.wait_for_selector(".js-LibraryExport", timeout=10000)
 
         export_button = page.locator(".js-LibraryExport").first
         while True:
-            if export_button.is_visible():
-                export_button.click()
+            if await export_button.is_visible():
+                await export_button.click()
                 break
-            page.wait_for_timeout(500)
+            await page.wait_for_timeout(500)
         
         prepped_export_list = page.locator(".fileList")
         for _ in range(240):
-            if prepped_export_list.count() > 0 and prepped_export_list.locator("a").count() > 0:
+            if await prepped_export_list.count() > 0 and await prepped_export_list.locator("a").count() > 0:
                 break
-            page.wait_for_timeout(500)
+            await page.wait_for_timeout(500)
         
         # Export library
-        with page.expect_download() as download_info:
+        async with page.expect_download() as download_info:
             list = prepped_export_list.locator("a").first
-            list.click()
-        download_info.value.save_as(MY_LIBRARY_PATH)
-        browser.close()
+            await list.click()
+        
+        download = await download_info.value
+        await download.save_as(MY_LIBRARY_PATH)
+        await browser.close()
 
     return preprocess_library()
 
 
-def scrape_lists(lists_path, force_all=False):
+async def scrape_lists(lists_path, force_all=False):
     if not lists_path.exists():
+        print(f"No list metadata found at {lists_path}")
         user_input = input("Enter comma-separated list IDs to track: ")
         if not user_input.strip():
             return pd.DataFrame()
@@ -86,6 +89,11 @@ def scrape_lists(lists_path, force_all=False):
     else:
         meta_df = pd.read_csv(lists_path)
 
+    # Ensure columns exist and types are consistent
+    for col in ['date_last_scraped', 'scrape_complete']:
+        if col not in meta_df.columns: meta_df[col] = None
+    meta_df['list_id'] = meta_df['list_id'].astype(int)
+
     if force_all:
         to_scrape_idxs = meta_df.index
     else:
@@ -96,83 +104,122 @@ def scrape_lists(lists_path, force_all=False):
             return pd.read_csv(FRIENDS_LIBRARIES_PATH)
         return pd.DataFrame()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=USER_AGENT)
-        page = context.new_page()
+    # Shared locks
+    csv_lock = asyncio.Lock()
+    meta_lock = asyncio.Lock()
 
-        # Write header if file doesn't exist
-        file_exists = FRIENDS_LIBRARIES_PATH.exists() and FRIENDS_LIBRARIES_PATH.stat().st_size > 0
-        write_header = not file_exists
-        
+    # Write header if file doesn't exist
+    file_exists = FRIENDS_LIBRARIES_PATH.exists() and FRIENDS_LIBRARIES_PATH.stat().st_size > 0
+    write_header = not file_exists
+
+    if write_header:
         with open(FRIENDS_LIBRARIES_PATH, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            if write_header:
-                writer.writerow(["list_id", "book_id", "title", "rating", "num_pages", "date_read", "date_added"])
+            writer.writerow(["list_id", "book_id", "title", "rating", "num_pages", "date_read", "date_added"])
 
-            for idx in to_scrape_idxs:
-                row_data = meta_df.loc[idx]
-                list_id = str(row_data['list_id'])
-                print(f"Scraping list {list_id}...")
+    async def process_list(page_pool, idx):
+        page = await page_pool.get()
+        try:
+            # Re-read meta to get current state (though strictly we are just reading row data)
+            # Accessing dataframe in thread-safe way is tricky if modifying, but here we just read row_data
+            row_data = meta_df.loc[idx]
+            list_id = str(row_data['list_id'])
+            print(f"Scraping list {list_id}...")
 
-                try:
-                    url = f"https://www.goodreads.com/review/list/{list_id}?print=true&sort=rating&view=reviews"
-                    page.goto(url)
+            try:
+                url = f"https://www.goodreads.com/review/list/{list_id}?print=true&sort=rating&view=reviews"
+                await page.goto(url)
+                
+                while True:
+                    try:
+                        await page.wait_for_selector("#booksBody", timeout=10000)
+                    except:
+                        break
+
+                    # Scrape rows
+                    rows = await page.query_selector_all("tr.bookalike.review")
+                    extracted_data = []
                     
-                    while True:
+                    for row in rows:
                         try:
-                            page.wait_for_selector("#booksBody", timeout=10000)
-                        except:
-                            break
+                            title_el = await row.query_selector(".field.title a")
+                            title = clean_text(await title_el.inner_text()) if title_el else "Unknown"
+                            
+                            href = await title_el.get_attribute("href") if title_el else ""
+                            bid_match = re.search(r'/book/show/(\d+)', href)
+                            book_id = bid_match.group(1) if bid_match else "Unknown"
 
-                        rows = page.query_selector_all("tr.bookalike.review")
-                        for row in rows:
-                            try:
-                                title_el = row.query_selector(".field.title a")
-                                title = clean_text(title_el.inner_text()) if title_el else "Unknown"
-                                
-                                href = title_el.get_attribute("href") if title_el else ""
-                                bid_match = re.search(r'/book/show/(\d+)', href)
-                                book_id = bid_match.group(1) if bid_match else "Unknown"
+                            rating_el = await row.query_selector(".field.rating .staticStars")
+                            rating_title = await rating_el.get_attribute("title") if rating_el else ""
+                            rating = RATING_MAP.get(rating_title, 0)
 
-                                rating_el = row.query_selector(".field.rating .staticStars")
-                                rating = RATING_MAP.get(rating_el.get_attribute("title") if rating_el else "", 0)
+                            pages_el = await row.query_selector(".field.num_pages .value")
+                            pages_text = await pages_el.text_content() if pages_el else ""
+                            num_pages = re.sub(r"[^\d]", "", pages_text)
 
-                                pages_el = row.query_selector(".field.num_pages .value")
-                                num_pages = re.sub(r"[^\d]", "", pages_el.text_content()) if pages_el else ""
+                            dr_el = await row.query_selector(".field.date_read .date_read_value")
+                            date_read = clean_text(await dr_el.inner_text()) if dr_el else ""
 
-                                dr_el = row.query_selector(".field.date_read .date_read_value")
-                                date_read = clean_text(dr_el.inner_text()) if dr_el else ""
+                            da_el = await row.query_selector(".field.date_added span")
+                            date_added = await da_el.get_attribute("title") if da_el else ""
+                            if not date_added and da_el: 
+                                date_added = clean_text(await da_el.inner_text())
 
-                                da_el = row.query_selector(".field.date_added span")
-                                date_added = da_el.get_attribute("title") if da_el else ""
-                                if not date_added and da_el: date_added = clean_text(da_el.inner_text())
+                            extracted_data.append([list_id, book_id, title, rating, num_pages, date_read, date_added])
+                        except Exception:
+                            continue
 
-                                writer.writerow([list_id, book_id, title, rating, num_pages, date_read, date_added])
-                            except Exception:
-                                continue
-                        
-                        next_btn = page.query_selector("a.next_page")
-                        if next_btn and "disabled" not in next_btn.get_attribute("class"):
-                            with page.expect_navigation():
-                                next_btn.click()
-                            time.sleep(0.5)
-                        else:
-                            break
-                    
+                    # Write to CSV
+                    if extracted_data:
+                        async with csv_lock:
+                            with open(FRIENDS_LIBRARIES_PATH, mode='a', newline='', encoding='utf-8') as f:
+                                writer = csv.writer(f)
+                                writer.writerows(extracted_data)
+
+                    # Check next page
+                    next_btn = await page.query_selector("a.next_page")
+                    if next_btn:
+                        cls = await next_btn.get_attribute("class")
+                        if "disabled" not in cls:
+                            async with page.expect_navigation():
+                                await next_btn.click()
+                            await asyncio.sleep(0.5)
+                            continue
+                    break
+                
+                # Update metadata on success
+                async with meta_lock:
                     meta_df.at[idx, 'scrape_complete'] = True
                     meta_df.at[idx, 'date_last_scraped'] = datetime.now().strftime("%Y-%m-%d")
                     meta_df.to_csv(lists_path, index=False)
-                    
-                except Exception as e:
-                    print(f"Failed list {list_id}: {e}")
+                
+            except Exception as e:
+                print(f"Failed list {list_id}: {e}")
 
-        browser.close()
+        finally:
+            page_pool.put_nowait(page)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=USER_AGENT)
+        page_pool = asyncio.Queue()
+        for _ in range(CONCURRENCY):
+            page_pool.put_nowait(await context.new_page())
+
+        tasks = [process_list(page_pool, idx) for idx in to_scrape_idxs]
+        await asyncio.gather(*tasks)
+        await browser.close()
     
-    friends_df = pd.read_csv(FRIENDS_LIBRARIES_PATH)
-    friends_df = friends_df.drop_duplicates(subset=['list_id', 'book_id'])
-    friends_df.to_csv(FRIENDS_LIBRARIES_PATH, index=False)
-    return friends_df
+    if FRIENDS_LIBRARIES_PATH.exists():
+        friends_df = pd.read_csv(FRIENDS_LIBRARIES_PATH)
+        # Ensure consistency
+        friends_df['book_id'] = pd.to_numeric(friends_df['book_id'], errors='coerce').fillna(0).astype(int)
+        friends_df['list_id'] = pd.to_numeric(friends_df['list_id'], errors='coerce').fillna(0).astype(int)
+        
+        friends_df = friends_df.drop_duplicates(subset=['list_id', 'book_id'])
+        friends_df.to_csv(FRIENDS_LIBRARIES_PATH, index=False)
+        return friends_df
+    return pd.DataFrame()
 
 
 def parse_and_score_similar_books(encoded_str, scoring_func):
@@ -522,22 +569,23 @@ async def run_crawler(library_df, friends_df):
         cycle += 1
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-fd", action="store_true")
+    parser.add_argument("-fd", action="store_true", help="Force download of my library")
+    parser.add_argument("-fs", action="store_true", help="Force scrape of friend lists")
     args = parser.parse_args()
 
     if args.fd or not glob.glob(str(MY_LIBRARY_PATH)):
         load_dotenv()
-        library_df = download_library(os.getenv("GOODREADS_EMAIL"), os.getenv("GOODREADS_PASSWORD"))
+        library_df = await download_library(os.getenv("GOODREADS_EMAIL"), os.getenv("GOODREADS_PASSWORD"))
     else:
         library_df = pd.read_csv(MY_LIBRARY_PATH)
 
-    force_lists = args.fd or not FRIENDS_LIBRARIES_PATH.exists()
-    friends_df = scrape_lists(FRIEND_LISTS_PATH, force_all=force_lists)
+    force_lists = args.fs or not FRIENDS_LIBRARIES_PATH.exists()
+    friends_df = await scrape_lists(FRIEND_LISTS_PATH, force_all=force_lists)
 
     try:
-        asyncio.run(run_crawler(library_df, friends_df))
+        await run_crawler(library_df, friends_df)
     except KeyboardInterrupt:
         pass
 
@@ -561,4 +609,4 @@ SCORING_FUNCTIONS = {
 }
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
