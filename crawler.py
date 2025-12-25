@@ -18,7 +18,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 from playwright.async_api import async_playwright
-from playwright.sync_api import sync_playwright
 
 RATING_MAP = {"it was amazing": 5, "really liked it": 4, "liked it": 3, "it was ok": 2, "did not like it": 1,}
 
@@ -259,13 +258,12 @@ def filter_save_file():
 
 
 def prep_crawl_heapq(library_df, friends_df, scoring_func):
-     # Prioritize library seed ids
-    crawl_queue = {int(book_id): 9e7 for book_id in library_df['book_id'].dropna()}
+    seed_ids = set(library_df['book_id'].dropna().astype(int))
     if friends_df is not None and not friends_df.empty:
-        for book_id in friends_df['book_id'].dropna().unique():
-            bid = int(book_id)
-            if bid not in crawl_queue:
-                crawl_queue[bid] = 9e7
+        seed_ids.update(friends_df['book_id'].dropna().astype(int))
+
+     # Prioritize library seed ids
+    crawl_queue = {bid: 9e7 for bid in seed_ids}
 
     scraped_ids = set()
     if OUTPUT_PATH.exists():
@@ -283,10 +281,10 @@ def prep_crawl_heapq(library_df, friends_df, scoring_func):
     crawl_queue = [(-rating, book_id) for book_id, rating in crawl_queue.items()]
     heapq.heapify(crawl_queue)
 
-    return crawl_queue, scraped_ids, {book_id for _, book_id in crawl_queue}
+    return crawl_queue, scraped_ids, {book_id for _, book_id in crawl_queue}, seed_ids
 
 
-async def fetch_book(page, book_id):
+async def fetch_book(page, book_id, bad_book_ids):
 
     async def handle_response(response):       
         if collecting and "graphql" in response.url and response.request.method == "POST":
@@ -429,13 +427,18 @@ async def fetch_book(page, book_id):
     
     async def close_modal(page):
         try:
-            close_btn = page.locator(".Overlay__close button, [aria-label='Close']").first
+            close_btn = page.locator(".Overlay .Overlay__close button").first
             if await close_btn.is_visible():
-                await close_btn.click(timeout=2000)
-        except Exception:
+                await close_btn.evaluate("node => node.click()")
+        except Exception as e:
+            tqdm.write(f"Failed to close modal: {e}")
             pass
 
-    await close_modal(page)
+    async def check_if_404(page):
+        if await page.locator(".ErrorPage__title").count() > 0:
+            return True
+        return False
+
     captured_payloads = []
     collecting = True
     page.on("response", handle_response)
@@ -443,6 +446,10 @@ async def fetch_book(page, book_id):
         url = f"https://www.goodreads.com/book/show/{book_id}"
         await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
         await page.evaluate(f"window.scrollBy(0, {random.randint(100,200)})")
+
+        if await check_if_404(page):
+            bad_book_ids.add(book_id)
+            raise ValueError(f"Book {book_id} not found (404)")
         await close_modal(page)
 
         book_data = await extract_linked_data_basics(page, book_id)
@@ -452,8 +459,8 @@ async def fetch_book(page, book_id):
         return book_data
 
     except Exception as e:
-        if "Target closed" not in str(e):
-             tqdm.write(f"Failed {book_id} -- {e}")
+        if "not found (404)" not in str(e):
+            tqdm.write(f"Failed {book_id} -- {e}")
         return None
     finally:
         collecting = False
@@ -472,9 +479,9 @@ async def run_crawler(library_df, friends_df):
         else:
             await route.continue_()
 
-    async def fetch_wrapper(page_pool, page, book_id):
+    async def fetch_wrapper(page_pool, page, book_id, bad_book_ids):
         try:
-            return await fetch_book(page, book_id)
+            return await fetch_book(page, book_id, bad_book_ids)
         finally:
             page_pool.put_nowait(page)
 
@@ -486,6 +493,7 @@ async def run_crawler(library_df, friends_df):
         "author_num_books", "currently_reading"
     ]
 
+    bad_book_ids = set()
     cycle = 0
     scoring_algo_names = list(SCORING_FUNCTIONS.keys())
     while True:
@@ -493,7 +501,7 @@ async def run_crawler(library_df, friends_df):
         scoring_func = SCORING_FUNCTIONS[current_algo_name]
 
         # filter_save_file()
-        crawl_queue, scraped_ids, queued_ids = prep_crawl_heapq(library_df, friends_df, scoring_func)
+        crawl_queue, scraped_ids, queued_ids, seed_ids = prep_crawl_heapq(library_df, friends_df, scoring_func)
         if not crawl_queue:
             break
 
@@ -503,11 +511,12 @@ async def run_crawler(library_df, friends_df):
             if not file_exists:
                 writer.writeheader()
 
+            remaining_seeds = seed_ids - scraped_ids
             pbar = tqdm(
                 total=len(scraped_ids) + len(crawl_queue), 
                 initial=len(scraped_ids), 
                 unit='book',
-                desc=f"{current_algo_name}" 
+                desc=f"{current_algo_name} | {f'{len(remaining_seeds)} Seeds remaining' if remaining_seeds else 'Seeds done'}" 
             )
 
             async with async_playwright() as p:
@@ -525,11 +534,11 @@ async def run_crawler(library_df, friends_df):
                     while (crawl_queue or active_tasks) and processed < RESTART_THRESHOLD:
                         while crawl_queue and not page_pool.empty() and processed < RESTART_THRESHOLD:
                             _, book_id = heapq.heappop(crawl_queue)
-                            if book_id in scraped_ids:
+                            if book_id in scraped_ids or book_id in bad_book_ids:
                                 continue
 
                             page = page_pool.get_nowait()
-                            task = asyncio.create_task(fetch_wrapper(page_pool, page, book_id))
+                            task = asyncio.create_task(fetch_wrapper(page_pool, page, book_id, bad_book_ids))
                             active_tasks.add(task)
 
                         if not active_tasks:
@@ -543,7 +552,17 @@ async def run_crawler(library_df, friends_df):
                                 if book_data:
                                     writer.writerow(book_data)
                                     f.flush()
-                                    scraped_ids.add(book_data['book_id'])
+                                    
+                                    bid = book_data['book_id']
+                                    scraped_ids.add(bid)
+
+                                    if bid in remaining_seeds:
+                                        remaining_seeds.remove(bid)
+                                        if remaining_seeds:
+                                            pbar.set_description(f"{len(remaining_seeds)} Seeds remaining")
+                                        else:
+                                            pbar.set_description(f"{current_algo_name} | Seeds done")
+
                                     pbar.update(1)
                                 
                                     added = 0
