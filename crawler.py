@@ -8,9 +8,11 @@ import heapq
 import html
 import csv
 import random
+import time
 import pandas as pd
 import numpy as np
 import traceback
+from datetime import datetime
 from bs4 import BeautifulSoup
 from pathlib import Path
 from dotenv import load_dotenv
@@ -18,13 +20,17 @@ from tqdm.asyncio import tqdm
 from playwright.async_api import async_playwright
 from playwright.sync_api import sync_playwright
 
+RATING_MAP = {"it was amazing": 5, "really liked it": 4, "liked it": 3, "it was ok": 2, "did not like it": 1,}
+
+def clean_text(text):
+    return text.strip().replace("\n", "") if text else ""
 
 def download_library(email, password):
 
     def preprocess_library():
-        df = pd.read_csv(LIBRARY_PATH)
+        df = pd.read_csv(MY_LIBRARY_PATH)
         df.columns = [col.lower().replace(' ','_') for col in df.columns]
-        df.to_csv(LIBRARY_PATH, index=False)
+        df.to_csv(MY_LIBRARY_PATH, index=False)
         return df
 
     with sync_playwright() as p:
@@ -60,10 +66,113 @@ def download_library(email, password):
         with page.expect_download() as download_info:
             list = prepped_export_list.locator("a").first
             list.click()
-        download_info.value.save_as(LIBRARY_PATH)
+        download_info.value.save_as(MY_LIBRARY_PATH)
         browser.close()
 
     return preprocess_library()
+
+
+def scrape_lists(lists_path, force_all=False):
+    if not lists_path.exists():
+        user_input = input("Enter comma-separated list IDs to track: ")
+        if not user_input.strip():
+            return pd.DataFrame()
+        
+        list_ids = [lid.strip() for lid in user_input.split(',') if lid.strip()]
+        meta_df = pd.DataFrame({'list_id': list_ids})
+        meta_df['scrape_complete'] = False
+        meta_df['date_last_scraped'] = None
+        meta_df.to_csv(lists_path, index=False)
+    else:
+        meta_df = pd.read_csv(lists_path)
+
+    if force_all:
+        to_scrape_idxs = meta_df.index
+    else:
+        to_scrape_idxs = meta_df[meta_df['scrape_complete'] != True].index
+
+    if len(to_scrape_idxs) == 0:
+        if FRIENDS_LIBRARIES_PATH.exists():
+            return pd.read_csv(FRIENDS_LIBRARIES_PATH)
+        return pd.DataFrame()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=USER_AGENT)
+        page = context.new_page()
+
+        # Write header if file doesn't exist
+        file_exists = FRIENDS_LIBRARIES_PATH.exists() and FRIENDS_LIBRARIES_PATH.stat().st_size > 0
+        write_header = not file_exists
+        
+        with open(FRIENDS_LIBRARIES_PATH, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["list_id", "book_id", "title", "rating", "num_pages", "date_read", "date_added"])
+
+            for idx in to_scrape_idxs:
+                row_data = meta_df.loc[idx]
+                list_id = str(row_data['list_id'])
+                print(f"Scraping list {list_id}...")
+
+                try:
+                    url = f"https://www.goodreads.com/review/list/{list_id}?print=true&sort=rating&view=reviews"
+                    page.goto(url)
+                    
+                    while True:
+                        try:
+                            page.wait_for_selector("#booksBody", timeout=10000)
+                        except:
+                            break
+
+                        rows = page.query_selector_all("tr.bookalike.review")
+                        for row in rows:
+                            try:
+                                title_el = row.query_selector(".field.title a")
+                                title = clean_text(title_el.inner_text()) if title_el else "Unknown"
+                                
+                                href = title_el.get_attribute("href") if title_el else ""
+                                bid_match = re.search(r'/book/show/(\d+)', href)
+                                book_id = bid_match.group(1) if bid_match else "Unknown"
+
+                                rating_el = row.query_selector(".field.rating .staticStars")
+                                rating = RATING_MAP.get(rating_el.get_attribute("title") if rating_el else "", 0)
+
+                                pages_el = row.query_selector(".field.num_pages .value")
+                                num_pages = re.sub(r"[^\d]", "", pages_el.text_content()) if pages_el else ""
+
+                                dr_el = row.query_selector(".field.date_read .date_read_value")
+                                date_read = clean_text(dr_el.inner_text()) if dr_el else ""
+
+                                da_el = row.query_selector(".field.date_added span")
+                                date_added = da_el.get_attribute("title") if da_el else ""
+                                if not date_added and da_el: date_added = clean_text(da_el.inner_text())
+
+                                writer.writerow([list_id, book_id, title, rating, num_pages, date_read, date_added])
+                            except Exception:
+                                continue
+                        
+                        next_btn = page.query_selector("a.next_page")
+                        if next_btn and "disabled" not in next_btn.get_attribute("class"):
+                            with page.expect_navigation():
+                                next_btn.click()
+                            time.sleep(0.5)
+                        else:
+                            break
+                    
+                    meta_df.at[idx, 'scrape_complete'] = True
+                    meta_df.at[idx, 'date_last_scraped'] = datetime.now().strftime("%Y-%m-%d")
+                    meta_df.to_csv(lists_path, index=False)
+                    
+                except Exception as e:
+                    print(f"Failed list {list_id}: {e}")
+
+        browser.close()
+    
+    friends_df = pd.read_csv(FRIENDS_LIBRARIES_PATH)
+    friends_df = friends_df.drop_duplicates(subset=['list_id', 'book_id'])
+    friends_df.to_csv(FRIENDS_LIBRARIES_PATH, index=False)
+    return friends_df
 
 
 def parse_and_score_similar_books(encoded_str, scoring_func):
@@ -102,10 +211,16 @@ def filter_save_file():
             traceback.print_exc()
 
 
-def prep_crawl_heapq(library_df, scoring_func):
-    crawl_queue = {int(book_id): 9e7 for book_id in library_df['book_id'].dropna()} # Prioritize library seed ids
-    scraped_ids = set()
+def prep_crawl_heapq(library_df, friends_df, scoring_func):
+     # Prioritize library seed ids
+    crawl_queue = {int(book_id): 9e7 for book_id in library_df['book_id'].dropna()}
+    if friends_df is not None and not friends_df.empty:
+        for book_id in friends_df['book_id'].dropna().unique():
+            bid = int(book_id)
+            if bid not in crawl_queue:
+                crawl_queue[bid] = 9e7
 
+    scraped_ids = set()
     if OUTPUT_PATH.exists():
         scraped_df = pd.read_csv(OUTPUT_PATH, usecols=['book_id', 'similar_books'], on_bad_lines='skip')
         scraped_ids.update(scraped_df['book_id'].dropna().astype(int))
@@ -143,6 +258,11 @@ async def fetch_book(page, book_id):
         agg_rating = ld.get("aggregateRating", {})
         title = html.unescape(ld.get("name", ""))
         authors = "|".join(a["name"] for a in ld.get("author", []) if "name" in a)
+        langs = ld.get("inLanguage")
+        if isinstance(langs, str):
+            langs = "|".join(lang.strip() for lang in langs.split(";"))
+        else:
+            langs = ""
         return {
             "book_id": book_id,
             "title": title,
@@ -150,7 +270,7 @@ async def fetch_book(page, book_id):
             "avg_rating": agg_rating.get("ratingValue"),
             "review_count": agg_rating.get("reviewCount"),
             "num_pages": ld.get("numberOfPages"),
-            "lang": ld.get("inLanguage"),
+            "lang": langs,
         }
 
 
@@ -220,7 +340,6 @@ async def fetch_book(page, book_id):
 
         # Author stats
         author_stats_el = soup.select_one(".FeaturedPerson__infoPrimary .Text__subdued")
-        
         book_data['author_num_books'] = 0
         book_data['author_followers'] = 0
         if author_stats_el:
@@ -298,7 +417,7 @@ async def fetch_book(page, book_id):
             pass
 
 
-async def run_crawler(library_df):
+async def run_crawler(library_df, friends_df):
 
     async def block_media(route):
         if route.request.resource_type in ["image", "media", "font"]:
@@ -327,8 +446,7 @@ async def run_crawler(library_df):
         scoring_func = SCORING_FUNCTIONS[current_algo_name]
 
         # filter_save_file()
-        crawl_queue, scraped_ids, queued_ids = prep_crawl_heapq(library_df, scoring_func)
-
+        crawl_queue, scraped_ids, queued_ids = prep_crawl_heapq(library_df, friends_df, scoring_func)
         if not crawl_queue:
             break
 
@@ -409,25 +527,28 @@ def main():
     parser.add_argument("-fd", action="store_true")
     args = parser.parse_args()
 
-    if args.fd or not glob.glob(str(LIBRARY_PATH)):
-        email = os.getenv("GOODREADS_EMAIL")
-        password = os.getenv("GOODREADS_PASSWORD")
-        library_df = download_library(email, password)
+    if args.fd or not glob.glob(str(MY_LIBRARY_PATH)):
+        load_dotenv()
+        library_df = download_library(os.getenv("GOODREADS_EMAIL"), os.getenv("GOODREADS_PASSWORD"))
     else:
-        library_df = pd.read_csv(LIBRARY_PATH)
+        library_df = pd.read_csv(MY_LIBRARY_PATH)
+
+    force_lists = args.fd or not FRIENDS_LIBRARIES_PATH.exists()
+    friends_df = scrape_lists(FRIEND_LISTS_PATH, force_all=force_lists)
 
     try:
-        asyncio.run(run_crawler(library_df))
+        asyncio.run(run_crawler(library_df, friends_df))
     except KeyboardInterrupt:
         pass
 
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
-LIBRARY_PATH = DATA_DIR / "goodreads_library_export.csv"
+MY_LIBRARY_PATH = DATA_DIR / "goodreads_library_export.csv"
 OUTPUT_PATH = DATA_DIR / "books.csv"
+FRIENDS_LIBRARIES_PATH = DATA_DIR / "friend_ratings.csv"
+FRIEND_LISTS_PATH = DATA_DIR / "friend_lists.csv"
 
-load_dotenv()
 CONCURRENCY = 3
 PAYLOAD_WAIT_ATTEMPTS = 20
 PAGE_TIMEOUT_MS = 20000
