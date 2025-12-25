@@ -8,7 +8,6 @@ import heapq
 import html
 import csv
 import random
-import time
 import pandas as pd
 import numpy as np
 import traceback
@@ -511,7 +510,7 @@ async def run_crawler(library_df, friends_df):
             if not file_exists:
                 writer.writeheader()
 
-            remaining_seeds = seed_ids - scraped_ids
+            remaining_seeds = seed_ids - scraped_ids - bad_book_ids
             pbar = tqdm(
                 total=len(scraped_ids) + len(crawl_queue), 
                 initial=len(scraped_ids), 
