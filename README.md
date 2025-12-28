@@ -1,6 +1,6 @@
 # Goodreads Crawler & Ranker
 
-Async crawler and recommender system to find good books to read.
+Async crawler and ML recommendation pipeline to find good books to read.
 
 ## Setup 
 1. **Save Books to Your Goodreads Library:**
