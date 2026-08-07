@@ -8,6 +8,14 @@ def _needs_embedding_model_migration(db_conn, table_name: str) -> bool:
     )
 
 
+def _needs_library_books_migration(db_conn) -> bool:
+    cursor = db_conn.execute("PRAGMA table_info(library_books)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if not columns:
+        return False
+    return "average_rating" not in columns or "ratings_count" not in columns
+
+
 def migrate_embedding_model_schema(db_conn):
     fk_row = db_conn.execute("PRAGMA foreign_keys").fetchone()
     original_fk = int(fk_row[0]) if fk_row else 1
@@ -59,6 +67,15 @@ def migrate_embedding_model_schema(db_conn):
         if _needs_embedding_model_migration(db_conn, "book_predictions"):
             db_conn.execute("DROP TABLE IF EXISTS book_predictions")
             print("✓ Dropped book_predictions (old schema) — will repopulate on next predict run.")
+
+        if _needs_library_books_migration(db_conn):
+            cursor = db_conn.execute("PRAGMA table_info(library_books)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            if "average_rating" not in existing_cols:
+                db_conn.execute("ALTER TABLE library_books ADD COLUMN average_rating REAL")
+            if "ratings_count" not in existing_cols:
+                db_conn.execute("ALTER TABLE library_books ADD COLUMN ratings_count INTEGER")
+            print("✓ Migrated library_books schema (added average_rating and ratings_count).")
 
         db_conn.commit()
     except Exception:

@@ -424,11 +424,8 @@ def run_prediction(
 
         v = books_df["rating_count"].astype(float)
         book_avg = books_df["avg_rating"].fillna(0.0).astype(float)
-        count_adjusted = np.where(
-            v > 0,
-            book_avg - (book_avg / np.log10(v + 10)),
-            0.0,
-        )
+        global_avg_rating = db.get_global_avg_rating(db_conn)
+        count_adjusted = config.calculate_count_adjusted_rating(book_avg, v, global_avg_rating)
 
         scaler = MinMaxScaler()
         valid_mask = ~np.isnan(solo_final_pred)

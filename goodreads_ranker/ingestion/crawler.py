@@ -330,6 +330,8 @@ async def run_crawler(limit=None, force_crawl=False, db_path=None):
         if force_crawl:
             db.handle_force_crawl(db_conn)
 
+        db.recalculate_pending_crawl_priorities(db_conn)
+
         expand_similar = limit is not None
         effective_limit = limit if (limit is not None and limit > 0) else None
 

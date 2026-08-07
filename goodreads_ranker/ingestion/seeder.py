@@ -249,13 +249,19 @@ async def extract_friend_row(row, library_id):
         static_stars = await rating_container.query_selector(".staticStars")
         if static_stars:
             rating_text = await static_stars.get_attribute("title") or ""
-            rating = RATING_MAP.get(rating_text, 0)
+            rating = RATING_MAP.get(rating_text.strip().lower(), 0)
+            if rating == 0 and rating_text:
+                match = re.search(r"(\d+)", rating_text)
+                if match:
+                    with contextlib.suppress(ValueError, TypeError):
+                        rating = int(match.group(1))
         else:
             stars_el = await rating_container.query_selector(".stars")
             if stars_el:
                 data_rating = await stars_el.get_attribute("data-rating")
-                if data_rating and data_rating.isdigit():
-                    rating = int(data_rating)
+                if data_rating:
+                    with contextlib.suppress(ValueError, TypeError):
+                        rating = int(float(data_rating))
 
     date_read_el = await row.query_selector(".field.date_read .date_read_value")
     date_read = clean_text(await date_read_el.inner_text()) if date_read_el else ""
@@ -267,12 +273,28 @@ async def extract_friend_row(row, library_id):
         if not date_added:
             date_added = clean_text(await date_added_el.inner_text())
 
+    avg_rating_el = await row.query_selector(".field.avg_rating .value")
+    avg_rating_text = clean_text(await avg_rating_el.inner_text()) if avg_rating_el else ""
+    avg_rating = None
+    if avg_rating_text:
+        with contextlib.suppress(ValueError):
+            avg_rating = float(avg_rating_text)
+
+    num_ratings_el = await row.query_selector(".field.num_ratings .value")
+    num_ratings_text = clean_text(await num_ratings_el.inner_text()).replace(",", "") if num_ratings_el else ""
+    num_ratings = None
+    if num_ratings_text:
+        with contextlib.suppress(ValueError):
+            num_ratings = int(num_ratings_text)
+
     return {
         "library_id": int(library_id),
         "book_legacy_id": legacy_id,
         "rating": rating,
         "date_read": parse_date_str(date_read),
         "date_added": parse_date_str(date_added),
+        "average_rating": avg_rating,
+        "ratings_count": num_ratings,
     }
 
 

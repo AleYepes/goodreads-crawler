@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+from goodreads_ranker.core import config
+
 DB_PATH = Path("data/goodreads.db")
 
 SCHEMA = """
@@ -92,12 +94,14 @@ CREATE TABLE IF NOT EXISTS prediction_hyperparams (
 
 -- 7. LIBRARY BOOKS
 CREATE TABLE IF NOT EXISTS library_books (
-    library_id     INTEGER NOT NULL REFERENCES libraries(legacy_id) ON DELETE CASCADE,
-    book_legacy_id INTEGER NOT NULL,
-    rating         INTEGER,
-    date_read      TEXT,
-    date_added     TEXT,
+    library_id        INTEGER NOT NULL REFERENCES libraries(legacy_id) ON DELETE CASCADE,
+    book_legacy_id    INTEGER NOT NULL,
+    rating            INTEGER,
+    date_read         TEXT,
+    date_added        TEXT,
     calibrated_rating REAL,
+    average_rating    REAL,
+    ratings_count     INTEGER,
     PRIMARY KEY (library_id, book_legacy_id)
 );
 
@@ -212,6 +216,7 @@ def get_connection(db_path=None):
         db_conn.execute("PRAGMA synchronous=NORMAL")
         db_conn.execute("PRAGMA foreign_keys=ON")
         db_conn.execute("PRAGMA busy_timeout=5000")
+        db_conn.create_function("LOG10", 1, math.log10)
         db_conn.row_factory = sqlite3.Row
         yield db_conn
     finally:
@@ -236,6 +241,50 @@ def init_db(db_path=None):
             """
         )
         db_conn.commit()
+
+
+def get_global_avg_rating(db_conn) -> float:
+    """Calculate the global average rating across deduplicated canonical books."""
+    query = """
+    WITH combined_ratings AS (
+        SELECT
+            COALESCE(bbl.best_book_id, lb.book_legacy_id) AS resolved_book_id,
+            lb.average_rating AS avg_rating
+        FROM library_books lb
+        LEFT JOIN best_book_lookup bbl ON lb.book_legacy_id = bbl.raw_legacy_id
+        WHERE lb.average_rating IS NOT NULL AND lb.average_rating > 0
+
+        UNION ALL
+
+        SELECT
+            COALESCE(bbl.best_book_id, sb.similar_legacy_id) AS resolved_book_id,
+            sb.average_rating AS avg_rating
+        FROM similar_books sb
+        LEFT JOIN best_book_lookup bbl ON sb.similar_legacy_id = bbl.raw_legacy_id
+        WHERE sb.average_rating IS NOT NULL AND sb.average_rating > 0
+
+        UNION ALL
+
+        SELECT
+            b.legacy_id AS resolved_book_id,
+            CASE
+                WHEN (star_1 + star_2 + star_3 + star_4 + star_5) > 0 THEN
+                    CAST(star_1*1 + star_2*2 + star_3*3 + star_4*4 + star_5*5 AS REAL) / (star_1 + star_2 + star_3 + star_4 + star_5)
+                ELSE NULL
+            END AS avg_rating
+        FROM books b
+        WHERE (star_1 + star_2 + star_3 + star_4 + star_5) > 0
+    ),
+    dedup_books AS (
+        SELECT resolved_book_id, AVG(avg_rating) AS book_avg
+        FROM combined_ratings
+        GROUP BY resolved_book_id
+    )
+    SELECT COALESCE(AVG(book_avg), 3.5) AS global_avg_rating FROM dedup_books
+    """
+    row = db_conn.execute(query).fetchone()
+    val = row["global_avg_rating"] if row else 3.5
+    return float(val) if val is not None else 3.5
 
 
 # Generic persistence helpers
@@ -397,6 +446,7 @@ def save_editions(db_conn, book_legacy_id, editions: list[dict]):
 
 
 def save_similar_books_and_enqueue(db_conn, book_legacy_id, similar_list: list[dict], now):
+    global_avg = get_global_avg_rating(db_conn)
     for sim in similar_list:
         sim_legacy_id = sim.get("legacy_id")
         avg_rating = sim.get("average_rating")
@@ -417,8 +467,8 @@ def save_similar_books_and_enqueue(db_conn, book_legacy_id, similar_list: list[d
             ),
         )
 
-        if sim_legacy_id and avg_rating is not None and ratings_count is not None:
-            priority = avg_rating - avg_rating / math.log10(ratings_count + 10)
+        if sim_legacy_id:
+            priority = config.calculate_count_adjusted_rating(avg_rating, ratings_count, global_avg)
             db_conn.execute(
                 """
                 INSERT INTO crawl_queue (book_legacy_id, priority, status, discovered_via)
@@ -539,6 +589,34 @@ def set_crawl_status(db_conn, legacy_id, status, error_count=0, last_error_messa
 def get_crawl_error_count(db_conn, legacy_id: int) -> int:
     row = db_conn.execute("SELECT error_count FROM crawl_queue WHERE book_legacy_id = ?", (legacy_id,)).fetchone()
     return (row["error_count"] or 0) if row else 0
+
+
+def recalculate_pending_crawl_priorities(db_conn):
+    """Recalculate priorities for pending similar books in crawl_queue using the current global average."""
+    global_avg = get_global_avg_rating(db_conn)
+    query = """
+    WITH max_similar_priorities AS (
+        SELECT 
+            similar_legacy_id,
+            MAX(
+                CASE 
+                    WHEN ratings_count > 0 AND average_rating IS NOT NULL THEN
+                        average_rating - ((average_rating - :global_avg) / LOG10(ratings_count + 10))
+                    ELSE :global_avg
+                END
+            ) AS max_priority
+        FROM similar_books
+        GROUP BY similar_legacy_id
+    )
+    UPDATE crawl_queue
+    SET priority = m.max_priority
+    FROM max_similar_priorities m
+    WHERE crawl_queue.book_legacy_id = m.similar_legacy_id
+      AND crawl_queue.status = 'pending'
+      AND crawl_queue.discovered_via = 'similar'
+    """
+    db_conn.execute(query, {"global_avg": global_avg})
+    db_conn.commit()
 
 
 def get_elo_ratings(db_conn) -> list[dict]:
@@ -732,36 +810,37 @@ def get_candidate_book_legacy_ids(db_conn) -> set[int]:
     2. Top 50% globally across all library books using log10 count-adjusted rating.
     3. Similar books linked to books in the top 50% evaluated per library.
     """
+    global_avg = get_global_avg_rating(db_conn)
     query = """
     WITH book_scores AS (
-        SELECT 
+        SELECT
             legacy_id,
             (star_1 + star_2 + star_3 + star_4 + star_5) AS ratings_count,
-            CASE 
+            CASE
                 WHEN (star_1 + star_2 + star_3 + star_4 + star_5) > 0 THEN
                     CAST(star_1*1 + star_2*2 + star_3*3 + star_4*4 + star_5*5 AS REAL) / (star_1 + star_2 + star_3 + star_4 + star_5)
-                ELSE 0.0
+                ELSE NULL
             END AS avg_rating
         FROM books
     ),
     book_adjusted AS (
-        SELECT 
+        SELECT
             legacy_id,
-            CASE 
-                WHEN ratings_count > 0 THEN
-                    avg_rating - (avg_rating / LOG10(ratings_count + 10))
-                ELSE 0.0
+            CASE
+                WHEN ratings_count > 0 AND avg_rating IS NOT NULL THEN
+                    avg_rating - ((avg_rating - :global_avg) / LOG10(ratings_count + 10))
+                ELSE :global_avg
             END AS adjusted_score
         FROM book_scores
     ),
     library_ranked AS (
-        SELECT 
+        SELECT
             lb.library_id,
             lb.book_legacy_id,
             lb.rating,
             ba.adjusted_score,
             ROW_NUMBER() OVER (
-                PARTITION BY lb.library_id 
+                PARTITION BY lb.library_id
                 ORDER BY lb.rating DESC, ba.adjusted_score DESC
             ) AS lib_rank,
             COUNT(*) OVER (PARTITION BY lb.library_id) AS lib_total,
@@ -778,14 +857,14 @@ def get_candidate_book_legacy_ids(db_conn) -> set[int]:
     ),
     -- Rule 2: Top 50% count-adjusted rated books globally across all library_books
     global_top_50 AS (
-        SELECT DISTINCT book_legacy_id 
-        FROM library_ranked 
+        SELECT DISTINCT book_legacy_id
+        FROM library_ranked
         WHERE global_rank <= (global_total * 0.5)
     ),
     -- Rule 3: Similar books linked to per-library top 50% books
     per_lib_top_50 AS (
-        SELECT DISTINCT book_legacy_id 
-        FROM library_ranked 
+        SELECT DISTINCT book_legacy_id
+        FROM library_ranked
         WHERE lib_rank <= (lib_total * 0.5)
     ),
     similar_candidates AS (
@@ -799,7 +878,7 @@ def get_candidate_book_legacy_ids(db_conn) -> set[int]:
     UNION
     SELECT book_legacy_id FROM similar_candidates
     """
-    cursor = db_conn.execute(query)
+    cursor = db_conn.execute(query, {"global_avg": global_avg})
     return {int(row["book_legacy_id"]) for row in cursor.fetchall()}
 
 
@@ -964,7 +1043,7 @@ def update_friend_info(db_conn, library_id, username, user_id):
 def load_existing_library_rows(db_conn, library_id) -> dict:
     rows = db_conn.execute(
         """
-        SELECT library_id, book_legacy_id, rating, date_read, date_added
+        SELECT library_id, book_legacy_id, rating, date_read, date_added, average_rating, ratings_count
         FROM library_books
         WHERE library_id = ?
         """,
@@ -977,6 +1056,8 @@ def load_existing_library_rows(db_conn, library_id) -> dict:
             "rating": int(row["rating"] or 0),
             "date_read": row["date_read"] or "",
             "date_added": row["date_added"] or "",
+            "average_rating": float(row["average_rating"]) if row["average_rating"] is not None else None,
+            "ratings_count": int(row["ratings_count"]) if row["ratings_count"] is not None else None,
         }
         for row in rows
     }
@@ -1023,10 +1104,12 @@ def upsert_library_books(db_conn, rows: list[dict]):
                 row["rating"],
                 row["date_read"],
                 row["date_added"],
+                row.get("average_rating"),
+                row.get("ratings_count"),
             )
             for row in rows
         ],
-        ["library_id", "book_legacy_id", "rating", "date_read", "date_added"],
+        ["library_id", "book_legacy_id", "rating", "date_read", "date_added", "average_rating", "ratings_count"],
     )
 
 

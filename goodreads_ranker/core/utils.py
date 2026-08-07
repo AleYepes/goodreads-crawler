@@ -133,6 +133,7 @@ def clean_description_text(text: str | None) -> str:
         return ""
 
     import warnings
+
     import ftfy
     from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 
